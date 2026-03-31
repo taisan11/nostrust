@@ -25,11 +25,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: p2witter-linux-x86_64
-            bin_path: target/debug/p2witter
+            artifact_name: nostrust-linux-x86_64
+            bin_path: target/debug/nostrust
           - os: windows-latest
-            artifact_name: p2witter-windows-x86_64
-            bin_path: target/debug/p2witter.exe
+            artifact_name: nostrust-windows-x86_64
+            bin_path: target/debug/nostrust.exe
     runs-on: ${{ matrix.os }}
 
     steps:

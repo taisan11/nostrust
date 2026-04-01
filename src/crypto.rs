@@ -27,6 +27,10 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 
 pub fn compute_event_id(event: &EventRecord) -> String {
     let serialized = serialize_event_data(event);
+    compute_event_id_from_serialized(&serialized)
+}
+
+pub fn compute_event_id_from_serialized(serialized: &str) -> String {
     let digest = Sha256::digest(serialized.as_bytes());
     bytes_to_hex(&digest)
 }
@@ -56,12 +60,7 @@ pub fn hex_to_fixed<const N: usize>(hex: &str) -> Result<[u8; N], String> {
     Ok(out)
 }
 
-pub fn verify_event_id_and_signature(event: &EventRecord) -> Result<(), String> {
-    let expected_id = compute_event_id(event);
-    if event.id != expected_id {
-        return Err("invalid: event id does not match serialized event hash".to_string());
-    }
-
+pub fn verify_event_signature(event: &EventRecord) -> Result<(), String> {
     let id_bytes = hex_to_fixed::<32>(&event.id)?;
     let sig_bytes = hex_to_fixed::<64>(&event.sig)?;
     let pubkey_bytes = hex_to_fixed::<32>(&event.pubkey)?;
@@ -74,6 +73,7 @@ pub fn verify_event_id_and_signature(event: &EventRecord) -> Result<(), String> 
     secp.verify_schnorr(&signature, &id_bytes, &pubkey)
         .map_err(|_| "invalid: bad event signature".to_string())
 }
+
 
 pub fn verify_delegation_signature(
     delegator_pubkey: &str,

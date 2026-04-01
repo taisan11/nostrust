@@ -1,20 +1,26 @@
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nojson::{DisplayJson, JsonFormatter, RawJson, RawJsonValue};
-use tokio_tungstenite::tungstenite::protocol::WebSocket;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message, accept};
 
 mod crypto;
+mod commands;
 mod persistence;
 
-use crate::crypto::{verify_delegation_signature, verify_event_id_and_signature};
+use crate::commands::{
+    count_matching_events, event_has_protected_tag, event_matches_filter, forward_live_events,
+    handle_text_frame, parse_filter, query_initial_events, search_score, send_auth_challenge,
+    subscription_is_complete, validate_auth_event, validate_subscription_id,
+};
+use crate::crypto::{
+    compute_event_id_from_serialized, verify_delegation_signature, verify_event_signature,
+};
 use crate::persistence::EventStore;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
@@ -324,7 +330,7 @@ fn relay_info_document(relay_config: &RelayConfig) -> String {
             "{{",
             "\"name\":\"nostrust\",",
             "\"description\":\"Simple Rust Nostr relay\",",
-            "\"supported_nips\":[1,9,11,26,29,40,42,45,50,65,70],",
+            "\"supported_nips\":[1,4,9,11,26,29,40,42,45,50,59,65,70,94,96],",
             "\"software\":\"https://github.com/taisan11/nostrust\",",
             "\"version\":\"{}\",",
             "\"limitation\":{{",
@@ -339,298 +345,65 @@ fn relay_info_document(relay_config: &RelayConfig) -> String {
     )
 }
 
-fn forward_live_events(
-    ws: &mut WebSocket<TcpStream>,
-    rx: &Receiver<Arc<EventRecord>>,
-    subscriptions: &HashMap<String, Vec<Filter>>,
-) -> Result<(), DynError> {
-    loop {
-        match rx.try_recv() {
-            Ok(event) => {
-                for (sub_id, filters) in subscriptions {
-                    if matches_any_filter(&event, filters) {
-                        send_event(ws, sub_id, &event)?;
-                    }
+fn escape_control_chars_in_json_strings(input: &str, preserve_invalid_escapes: bool) -> String {
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        if !in_string {
+            if ch == '"' {
+                in_string = true;
+            }
+            out.push(ch);
+            continue;
+        }
+
+        if escaped {
+            if matches!(ch, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') {
+                out.push(ch);
+            } else {
+                if preserve_invalid_escapes {
+                    out.push('\\');
+                    out.push(ch);
+                } else {
+                    let code = ch as u32;
+                    out.push_str("\\u");
+                    out.push(hex_digit((code >> 12) as u8 & 0x0f));
+                    out.push(hex_digit((code >> 8) as u8 & 0x0f));
+                    out.push(hex_digit((code >> 4) as u8 & 0x0f));
+                    out.push(hex_digit(code as u8 & 0x0f));
                 }
             }
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            escaped = false;
+            continue;
         }
-    }
 
-    Ok(())
-}
-
-fn handle_text_frame(
-    ws: &mut WebSocket<TcpStream>,
-    subscriptions: &mut HashMap<String, Vec<Filter>>,
-    relay: &Arc<Mutex<RelayState>>,
-    event_store: &Arc<EventStore>,
-    relay_config: &RelayConfig,
-    auth: &mut ConnectionAuth,
-    text: &str,
-) -> Result<(), DynError> {
-    let raw = match RawJson::parse(text) {
-        Ok(value) => value,
-        Err(err) => {
-            send_notice(ws, &format!("invalid: {err}"))?;
-            return Ok(());
-        }
-    };
-
-    let root = raw.value();
-    let values: Vec<RawJsonValue<'_, '_>> = match root.try_into() {
-        Ok(values) => values,
-        Err(_) => {
-            send_notice(ws, "invalid: message must be a JSON array")?;
-            return Ok(());
-        }
-    };
-
-    if values.is_empty() {
-        send_notice(ws, "invalid: message must be a non-empty array")?;
-        return Ok(());
-    }
-
-    let command: String = match values[0].try_into() {
-        Ok(command) => command,
-        Err(_) => {
-            send_notice(ws, "invalid: first element must be a command string")?;
-            return Ok(());
-        }
-    };
-
-    match command.as_str() {
-        "REQ" => handle_req(ws, subscriptions, relay, &values),
-        "COUNT" => handle_count(ws, relay, &values),
-        "CLOSE" => handle_close(subscriptions, &values),
-        "EVENT" => handle_event(ws, relay, event_store, relay_config, auth, &values),
-        "AUTH" => handle_auth(ws, auth, &values),
-        _ => {
-            send_notice(ws, &format!("unsupported: command {command}"))?;
-            Ok(())
-        }
-    }
-}
-
-fn handle_req(
-    ws: &mut WebSocket<TcpStream>,
-    subscriptions: &mut HashMap<String, Vec<Filter>>,
-    relay: &Arc<Mutex<RelayState>>,
-    values: &[RawJsonValue<'_, '_>],
-) -> Result<(), DynError> {
-    if values.len() < 2 {
-        send_notice(ws, "invalid: REQ must include a subscription id")?;
-        return Ok(());
-    }
-
-    let sub_id: String = match values[1].try_into() {
-        Ok(sub_id) => sub_id,
-        Err(_) => {
-            send_notice(ws, "invalid: subscription id must be a string")?;
-            return Ok(());
-        }
-    };
-
-    if let Err(err) = validate_subscription_id(&sub_id) {
-        send_closed(ws, &sub_id, &err)?;
-        return Ok(());
-    }
-
-    if values.len() < 3 {
-        send_closed(ws, &sub_id, "invalid: REQ must include at least one filter")?;
-        return Ok(());
-    }
-
-    let mut filters = Vec::new();
-    for raw_filter in values.iter().skip(2) {
-        match parse_filter(*raw_filter) {
-            Ok(filter) => filters.push(filter),
-            Err(err) => {
-                send_closed(ws, &sub_id, &err)?;
-                return Ok(());
+        match ch {
+            '\\' => {
+                out.push('\\');
+                escaped = true;
             }
-        }
-    }
-
-    subscriptions.insert(sub_id.clone(), filters.clone());
-
-    let initial_events = {
-        let state = relay
-            .lock()
-            .map_err(|_| "error: relay state lock poisoned during REQ")?;
-        query_initial_events(&state, &filters)
-    };
-
-    for event in initial_events {
-        send_event(ws, &sub_id, &event)?;
-    }
-
-    send_eose(ws, &sub_id)?;
-    if subscription_is_complete(&filters) {
-        subscriptions.remove(&sub_id);
-        send_closed(ws, &sub_id, "closed: complete")?;
-    }
-    Ok(())
-}
-
-fn handle_count(
-    ws: &mut WebSocket<TcpStream>,
-    relay: &Arc<Mutex<RelayState>>,
-    values: &[RawJsonValue<'_, '_>],
-) -> Result<(), DynError> {
-    if values.len() < 2 {
-        send_notice(ws, "invalid: COUNT must include a query id")?;
-        return Ok(());
-    }
-
-    let query_id: String = match values[1].try_into() {
-        Ok(query_id) => query_id,
-        Err(_) => {
-            send_notice(ws, "invalid: query id must be a string")?;
-            return Ok(());
-        }
-    };
-
-    if let Err(err) = validate_subscription_id(&query_id) {
-        send_closed(ws, &query_id, &err)?;
-        return Ok(());
-    }
-
-    if values.len() < 3 {
-        send_closed(
-            ws,
-            &query_id,
-            "invalid: COUNT must include at least one filter",
-        )?;
-        return Ok(());
-    }
-
-    let mut filters = Vec::new();
-    for raw_filter in values.iter().skip(2) {
-        match parse_filter(*raw_filter) {
-            Ok(filter) => filters.push(filter),
-            Err(err) => {
-                send_closed(ws, &query_id, &err)?;
-                return Ok(());
+            '"' => {
+                out.push('"');
+                in_string = false;
             }
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c <= '\u{1f}' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            _ => out.push(ch),
         }
     }
 
-    let count = {
-        let state = relay
-            .lock()
-            .map_err(|_| "error: relay state lock poisoned during COUNT")?;
-        count_matching_events(&state, &filters)
-    };
-
-    send_count(ws, &query_id, count)?;
-    Ok(())
+    out
 }
 
-fn handle_close(
-    subscriptions: &mut HashMap<String, Vec<Filter>>,
-    values: &[RawJsonValue<'_, '_>],
-) -> Result<(), DynError> {
-    if values.len() < 2 {
-        return Ok(());
-    }
-
-    let sub_id: String = match values[1].try_into() {
-        Ok(sub_id) => sub_id,
-        Err(_) => return Ok(()),
-    };
-
-    subscriptions.remove(&sub_id);
-    Ok(())
-}
-
-fn handle_event(
-    ws: &mut WebSocket<TcpStream>,
-    relay: &Arc<Mutex<RelayState>>,
-    event_store: &Arc<EventStore>,
-    relay_config: &RelayConfig,
-    auth: &ConnectionAuth,
-    values: &[RawJsonValue<'_, '_>],
-) -> Result<(), DynError> {
-    if values.len() != 2 {
-        send_ok(
-            ws,
-            "",
-            false,
-            "invalid: EVENT must contain exactly one event object",
-        )?;
-        return Ok(());
-    }
-
-    let event_id_hint = extract_event_id(values[1]);
-    let event = match parse_event(values[1]) {
-        Ok(event) => event,
-        Err(err) => {
-            send_ok(ws, &event_id_hint, false, &err)?;
-            return Ok(());
-        }
-    };
-
-    if is_auth_event_kind(event.kind) {
-        send_ok(
-            ws,
-            &event.id,
-            false,
-            "invalid: AUTH command must be used for kind 22242 events",
-        )?;
-        return Ok(());
-    }
-
-    if event_has_protected_tag(&event) {
-        if !relay_config.allow_protected_events {
-            send_ok(
-                ws,
-                &event.id,
-                false,
-                "restricted: protected events are disabled on this relay",
-            )?;
-            return Ok(());
-        }
-
-        if !auth.is_authenticated(&event.pubkey) {
-            send_ok(
-                ws,
-                &event.id,
-                false,
-                "auth-required: this event may only be published by its author",
-            )?;
-            return Ok(());
-        }
-    }
-
-    if event.kind == 5 {
-        apply_deletion_request(relay, &event)?;
-    }
-
-    match publish_event(relay, event) {
-        Ok(PublishOutcome::Accepted { event, message }) => {
-            if should_persist_event(&event)
-                && let Err(err) = event_store.append_event(&event)
-            {
-                eprintln!("persistence error: {err}");
-                send_notice(ws, &format!("warning: persistence failed: {err}"))?;
-            }
-            send_ok(ws, &event.id, true, &message)?;
-        }
-        Ok(PublishOutcome::DuplicateAccepted { event_id, message }) => {
-            send_ok(ws, &event_id, true, &message)?;
-        }
-        Err(err) => {
-            let fallback_id = if event_id_hint.is_empty() {
-                ""
-            } else {
-                &event_id_hint
-            };
-            send_ok(ws, fallback_id, false, &format!("error: {err}"))?;
-        }
-    }
-
-    Ok(())
+fn hex_digit(v: u8) -> char {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    HEX[v as usize] as char
 }
 
 fn load_persisted_events(
@@ -751,6 +524,15 @@ fn publish_event(
             if let Some(existing_id) = state.replaceable_index.get(&key).cloned() {
                 if let Some(existing_event) = state.events_by_id.get(&existing_id) {
                     if !is_better_replace_candidate(&event_arc, existing_event) {
+                        if event_arc.kind == 3 {
+                            state
+                                .archived_events_by_id
+                                .insert(event_arc.id.clone(), Arc::clone(&event_arc));
+                            return Ok(PublishOutcome::Accepted {
+                                event: event_arc,
+                                message: String::new(),
+                            });
+                        }
                         return Err("blocked: have newer replaceable event".to_string());
                     }
                 }
@@ -792,6 +574,9 @@ fn publish_event(
             }
         }
         KindClass::Ephemeral => {
+            state
+                .events_by_id
+                .insert(event_arc.id.clone(), Arc::clone(&event_arc));
             message = "".to_string();
         }
         KindClass::RegularOrOther => {
@@ -815,136 +600,15 @@ fn publish_event(
     })
 }
 
-fn send_event(
-    ws: &mut WebSocket<TcpStream>,
-    sub_id: &str,
-    event: &EventRecord,
-) -> Result<(), DynError> {
-    let frame = nojson::array(|f| {
-        f.element("EVENT")?;
-        f.element(sub_id)?;
-        f.element(event)
-    })
-    .to_string();
-
-    ws.send(Message::text(frame))?;
-    Ok(())
-}
-
-fn send_ok(
-    ws: &mut WebSocket<TcpStream>,
-    event_id: &str,
-    accepted: bool,
-    message: &str,
-) -> Result<(), DynError> {
-    let frame = nojson::array(|f| {
-        f.element("OK")?;
-        f.element(event_id)?;
-        f.element(accepted)?;
-        f.element(message)
-    })
-    .to_string();
-
-    ws.send(Message::text(frame))?;
-    Ok(())
-}
-
-fn send_eose(ws: &mut WebSocket<TcpStream>, sub_id: &str) -> Result<(), DynError> {
-    let frame = nojson::array(|f| {
-        f.element("EOSE")?;
-        f.element(sub_id)
-    })
-    .to_string();
-
-    ws.send(Message::text(frame))?;
-    Ok(())
-}
-
-fn send_closed(ws: &mut WebSocket<TcpStream>, sub_id: &str, message: &str) -> Result<(), DynError> {
-    let frame = nojson::array(|f| {
-        f.element("CLOSED")?;
-        f.element(sub_id)?;
-        f.element(message)
-    })
-    .to_string();
-
-    ws.send(Message::text(frame))?;
-    Ok(())
-}
-
-fn send_count(ws: &mut WebSocket<TcpStream>, query_id: &str, count: usize) -> Result<(), DynError> {
-    let payload = CountPayload { count };
-    let frame = nojson::array(|f| {
-        f.element("COUNT")?;
-        f.element(query_id)?;
-        f.element(&payload)
-    })
-    .to_string();
-
-    ws.send(Message::text(frame))?;
-    Ok(())
-}
-
-fn send_notice(ws: &mut WebSocket<TcpStream>, message: &str) -> Result<(), DynError> {
-    let frame = nojson::array(|f| {
-        f.element("NOTICE")?;
-        f.element(message)
-    })
-    .to_string();
-
-    ws.send(Message::text(frame))?;
-    Ok(())
-}
-
-fn send_auth_challenge(ws: &mut WebSocket<TcpStream>, challenge: &str) -> Result<(), DynError> {
-    let frame = nojson::array(|f| {
-        f.element("AUTH")?;
-        f.element(challenge)
-    })
-    .to_string();
-
-    ws.send(Message::text(frame))?;
-    Ok(())
-}
-
-fn handle_auth(
-    ws: &mut WebSocket<TcpStream>,
-    auth: &mut ConnectionAuth,
-    values: &[RawJsonValue<'_, '_>],
-) -> Result<(), DynError> {
-    if values.len() != 2 {
-        send_ok(
-            ws,
-            "",
-            false,
-            "invalid: AUTH must contain exactly one event object",
-        )?;
-        return Ok(());
-    }
-
-    let event_id_hint = extract_event_id(values[1]);
-    let event = match parse_event(values[1]) {
-        Ok(event) => event,
-        Err(err) => {
-            send_ok(ws, &event_id_hint, false, &err)?;
-            return Ok(());
-        }
-    };
-
-    match validate_auth_event(&event, auth) {
-        Ok(()) => {
-            auth.authenticated_pubkeys.insert(event.pubkey.clone());
-            send_ok(ws, &event.id, true, "")?;
-        }
-        Err(err) => {
-            send_ok(ws, &event.id, false, &err)?;
-        }
-    }
-
-    Ok(())
-}
-
 fn parse_event(value: RawJsonValue<'_, '_>) -> Result<EventRecord, String> {
+    parse_event_with_options(value, false, None)
+}
+
+fn parse_event_with_options(
+    value: RawJsonValue<'_, '_>,
+    skip_id_hash_check: bool,
+    raw_serialized: Option<&str>,
+) -> Result<EventRecord, String> {
     let id: String = value
         .to_member("id")
         .map_err(|e| format!("invalid: {e}"))?
@@ -969,17 +633,13 @@ fn parse_event(value: RawJsonValue<'_, '_>) -> Result<EventRecord, String> {
         return Err("invalid: pubkey must be 64-char lowercase hex".to_string());
     }
 
-    let created_at: i64 = value
+    let created_at = parse_event_created_at(
+        value
         .to_member("created_at")
         .map_err(|e| format!("invalid: {e}"))?
         .required()
-        .map_err(|e| format!("invalid: {e}"))?
-        .try_into()
-        .map_err(|e| format!("invalid: {e}"))?;
-
-    if created_at < 0 {
-        return Err("invalid: created_at must be >= 0".to_string());
-    }
+        .map_err(|e| format!("invalid: {e}"))?,
+    )?;
 
     let kind: u64 = value
         .to_member("kind")
@@ -1002,9 +662,10 @@ fn parse_event(value: RawJsonValue<'_, '_>) -> Result<EventRecord, String> {
     let mut tags = Vec::new();
     let mut has_addressable_d_tag = false;
     for tag in tags_value.to_array().map_err(|e| format!("invalid: {e}"))? {
-        let tag_values: Vec<String> = tag.try_into().map_err(|e| format!("invalid: {e}"))?;
+        let tag_values = parse_tag_values(tag)?;
         if tag_values.is_empty() {
-            return Err("invalid: each tag must be a non-empty string array".to_string());
+            tags.push(tag_values);
+            continue;
         }
 
         if tag_values[0] == "e" || tag_values[0] == "p" {
@@ -1075,397 +736,21 @@ fn parse_event(value: RawJsonValue<'_, '_>) -> Result<EventRecord, String> {
         sig,
     };
 
-    verify_event_id_and_signature(&event)?;
+    if !skip_id_hash_check {
+        if let Some(raw_serialized) = raw_serialized {
+            let raw_id = compute_event_id_from_serialized(raw_serialized);
+            if event.id != raw_id {
+                return Err("invalid: event id does not match serialized event hash".to_string());
+            }
+        } else if event.id != crate::crypto::compute_event_id(&event) {
+            return Err("invalid: event id does not match serialized event hash".to_string());
+        }
+    }
+    verify_event_signature(&event)?;
     validate_delegation(&event)?;
     validate_group_event_tags(&event)?;
     validate_nip65_relay_list_event(&event)?;
     Ok(event)
-}
-
-fn parse_filter(value: RawJsonValue<'_, '_>) -> Result<Filter, String> {
-    let mut filter = Filter::default();
-
-    for (key_raw, val) in value.to_object().map_err(|e| format!("invalid: {e}"))? {
-        let key: String = key_raw.try_into().map_err(|e| format!("invalid: {e}"))?;
-
-        match key.as_str() {
-            "ids" => {
-                filter.ids = Some(parse_string_array(val, true)?);
-                validate_hex_list(filter.ids.as_ref().expect("set by line above"), 64, "ids")?;
-            }
-            "authors" => {
-                filter.authors = Some(parse_string_array(val, true)?);
-                validate_hex_list(
-                    filter.authors.as_ref().expect("set by line above"),
-                    64,
-                    "authors",
-                )?;
-            }
-            "kinds" => {
-                let mut kinds = Vec::new();
-                let mut iter = val.to_array().map_err(|e| format!("invalid: {e}"))?;
-                let mut saw_any = false;
-
-                for raw_kind in &mut iter {
-                    saw_any = true;
-                    let kind: u64 = raw_kind.try_into().map_err(|e| format!("invalid: {e}"))?;
-                    if kind > 65535 {
-                        return Err("invalid: filter kinds must be 0..65535".to_string());
-                    }
-                    kinds.push(kind);
-                }
-
-                if !saw_any {
-                    return Err("invalid: filter arrays must not be empty".to_string());
-                }
-
-                filter.kinds = Some(kinds);
-            }
-            "search" => {
-                let search: String = val.try_into().map_err(|e| format!("invalid: {e}"))?;
-                filter.search = Some(search);
-            }
-            "since" => {
-                let since: i64 = val.try_into().map_err(|e| format!("invalid: {e}"))?;
-                if since < 0 {
-                    return Err("invalid: since must be >= 0".to_string());
-                }
-                filter.since = Some(since);
-            }
-            "until" => {
-                let until: i64 = val.try_into().map_err(|e| format!("invalid: {e}"))?;
-                if until < 0 {
-                    return Err("invalid: until must be >= 0".to_string());
-                }
-                filter.until = Some(until);
-            }
-            "limit" => {
-                let limit_raw: u64 = val.try_into().map_err(|e| format!("invalid: {e}"))?;
-                let limit = usize::try_from(limit_raw)
-                    .map_err(|_| "invalid: limit is too large for this relay".to_string())?;
-                filter.limit = Some(limit);
-            }
-            _ if is_tag_filter_key(&key) => {
-                let letter = key.chars().nth(1).expect("#x has second char");
-                let values = parse_string_array(val, true)?;
-
-                if letter == 'e' || letter == 'p' {
-                    validate_hex_list(&values, 64, "tag values")?;
-                }
-
-                filter.tag_values.insert(letter, values);
-            }
-            _ => return Err("unsupported: filter contains unknown elements".to_string()),
-        }
-    }
-
-    if let (Some(since), Some(until)) = (filter.since, filter.until)
-        && since > until
-    {
-        return Err("invalid: since must be <= until".to_string());
-    }
-
-    Ok(filter)
-}
-
-fn parse_string_array(value: RawJsonValue<'_, '_>, non_empty: bool) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
-    let mut iter = value.to_array().map_err(|e| format!("invalid: {e}"))?;
-
-    let mut saw_any = false;
-    for entry in &mut iter {
-        saw_any = true;
-        let s: String = entry.try_into().map_err(|e| format!("invalid: {e}"))?;
-        out.push(s);
-    }
-
-    if non_empty && !saw_any {
-        return Err("invalid: filter arrays must not be empty".to_string());
-    }
-
-    Ok(out)
-}
-
-fn validate_hex_list(values: &[String], len: usize, field_name: &str) -> Result<(), String> {
-    if values.iter().all(|v| is_lower_hex_of_len(v, len)) {
-        Ok(())
-    } else {
-        Err(format!(
-            "invalid: {field_name} must contain exact {len}-char lowercase hex values"
-        ))
-    }
-}
-
-fn validate_subscription_id(sub_id: &str) -> Result<(), String> {
-    if sub_id.is_empty() {
-        return Err("invalid: subscription id must not be empty".to_string());
-    }
-
-    if sub_id.len() > 64 {
-        return Err("invalid: subscription id max length is 64".to_string());
-    }
-
-    Ok(())
-}
-
-fn extract_event_id(value: RawJsonValue<'_, '_>) -> String {
-    value
-        .to_member("id")
-        .ok()
-        .and_then(|m| m.optional())
-        .and_then(|v| v.try_into().ok())
-        .unwrap_or_default()
-}
-
-fn query_initial_events(state: &RelayState, filters: &[Filter]) -> Vec<Arc<EventRecord>> {
-    let mut selected: HashMap<String, Arc<EventRecord>> = HashMap::new();
-
-    for filter in filters {
-        let mut matching = if let Some(ids) = &filter.ids {
-            ids.iter()
-                .filter_map(|id| {
-                    state
-                        .events_by_id
-                        .get(id)
-                        .or_else(|| state.archived_events_by_id.get(id))
-                        .cloned()
-                })
-                .collect::<Vec<_>>()
-        } else {
-            state.events_by_id.values().cloned().collect::<Vec<_>>()
-        };
-
-        matching.retain(|event| {
-            !state.deleted_event_ids.contains(&event.id)
-                && !event_blocked_by_address_tombstone(event, &state.deleted_addresses)
-                && (filter.ids.is_some() || !event_is_superseded(event, state))
-                && !is_event_expired(event, current_unix_timestamp())
-                && event_matches_filter(event, filter)
-        });
-
-        matching.sort_by(|a, b| compare_events_for_filter(filter, a, b));
-
-        if let Some(limit) = filter.limit {
-            matching.truncate(limit);
-        }
-
-        for event in matching {
-            selected.entry(event.id.clone()).or_insert(event);
-        }
-    }
-
-    let mut out = selected.into_values().collect::<Vec<_>>();
-    if filters.iter().any(|filter| filter.search.is_some()) {
-        out.sort_by(|a, b| compare_events_for_filters(filters, a, b));
-    } else {
-        out.sort_by(compare_events_desc);
-    }
-    out
-}
-
-fn compare_events_desc(a: &Arc<EventRecord>, b: &Arc<EventRecord>) -> Ordering {
-    b.created_at
-        .cmp(&a.created_at)
-        .then_with(|| a.id.cmp(&b.id))
-}
-
-fn compare_events_for_filter(
-    filter: &Filter,
-    a: &Arc<EventRecord>,
-    b: &Arc<EventRecord>,
-) -> Ordering {
-    if let Some(search) = &filter.search {
-        let a_score = search_score(a, search).unwrap_or(0);
-        let b_score = search_score(b, search).unwrap_or(0);
-        b_score
-            .cmp(&a_score)
-            .then_with(|| compare_events_desc(a, b))
-    } else {
-        compare_events_desc(a, b)
-    }
-}
-
-fn compare_events_for_filters(
-    filters: &[Filter],
-    a: &Arc<EventRecord>,
-    b: &Arc<EventRecord>,
-) -> Ordering {
-    let a_score = combined_search_score(a, filters);
-    let b_score = combined_search_score(b, filters);
-    b_score
-        .cmp(&a_score)
-        .then_with(|| compare_events_desc(a, b))
-}
-
-fn combined_search_score(event: &EventRecord, filters: &[Filter]) -> usize {
-    filters
-        .iter()
-        .filter_map(|filter| filter.search.as_ref().and_then(|q| search_score(event, q)))
-        .max()
-        .unwrap_or(0)
-}
-
-fn count_matching_events(state: &RelayState, filters: &[Filter]) -> usize {
-    let mut selected = HashSet::new();
-
-    for filter in filters {
-        let matching = if let Some(ids) = &filter.ids {
-            ids.iter()
-                .filter_map(|id| {
-                    state
-                        .events_by_id
-                        .get(id)
-                        .or_else(|| state.archived_events_by_id.get(id))
-                        .cloned()
-                })
-                .collect::<Vec<_>>()
-        } else {
-            state.events_by_id.values().cloned().collect::<Vec<_>>()
-        };
-
-        for event in matching {
-            if !state.deleted_event_ids.contains(&event.id)
-                && !event_blocked_by_address_tombstone(&event, &state.deleted_addresses)
-                && (filter.ids.is_some() || !event_is_superseded(&event, state))
-                && !is_event_expired(&event, current_unix_timestamp())
-                && event_matches_filter(&event, filter)
-            {
-                selected.insert(event.id.clone());
-            }
-        }
-    }
-
-    selected.len()
-}
-
-fn event_blocked_by_address_tombstone(
-    event: &EventRecord,
-    deleted_addresses: &HashMap<(u64, String, String), i64>,
-) -> bool {
-    if !matches!(
-        classify_kind(event.kind),
-        KindClass::Replaceable | KindClass::Addressable
-    ) {
-        return false;
-    }
-
-    let key = (event.kind, event.pubkey.clone(), event.d_tag_value());
-    deleted_addresses
-        .get(&key)
-        .is_some_and(|delete_ts| event.created_at <= *delete_ts)
-}
-
-fn event_is_superseded(event: &EventRecord, state: &RelayState) -> bool {
-    match classify_kind(event.kind) {
-        KindClass::Replaceable => {
-            let key = (event.pubkey.clone(), event.kind);
-            state
-                .replaceable_index
-                .get(&key)
-                .is_some_and(|active_id| active_id != &event.id)
-        }
-        KindClass::Addressable => {
-            let key = (event.kind, event.pubkey.clone(), event.d_tag_value());
-            state
-                .addressable_index
-                .get(&key)
-                .is_some_and(|active_id| active_id != &event.id)
-        }
-        KindClass::RegularOrOther | KindClass::Ephemeral => false,
-    }
-}
-
-fn subscription_is_complete(filters: &[Filter]) -> bool {
-    filters.iter().all(|filter| filter.ids.is_some())
-}
-
-fn matches_any_filter(event: &EventRecord, filters: &[Filter]) -> bool {
-    filters
-        .iter()
-        .any(|filter| event_matches_filter(event, filter))
-}
-
-fn event_matches_filter(event: &EventRecord, filter: &Filter) -> bool {
-    if let Some(ids) = &filter.ids
-        && !ids.iter().any(|id| id == &event.id)
-    {
-        return false;
-    }
-
-    if let Some(authors) = &filter.authors
-        && !authors.iter().any(|author| author == &event.pubkey)
-    {
-        return false;
-    }
-
-    if let Some(kinds) = &filter.kinds
-        && !kinds.iter().any(|kind| kind == &event.kind)
-    {
-        return false;
-    }
-
-    if let Some(since) = filter.since
-        && event.created_at < since
-    {
-        return false;
-    }
-
-    if let Some(until) = filter.until
-        && event.created_at > until
-    {
-        return false;
-    }
-
-    for (tag_name, wanted_values) in &filter.tag_values {
-        let mut matched = false;
-        let tag_name_str = tag_name.to_string();
-
-        for tag in &event.tags {
-            if tag.first().map(String::as_str) != Some(tag_name_str.as_str()) {
-                continue;
-            }
-
-            if let Some(value) = tag.get(1)
-                && wanted_values.iter().any(|wanted| wanted == value)
-            {
-                matched = true;
-                break;
-            }
-        }
-
-        if !matched {
-            return false;
-        }
-    }
-
-    if let Some(search) = &filter.search
-        && search_score(event, search).is_none()
-    {
-        return false;
-    }
-
-    true
-}
-
-fn search_score(event: &EventRecord, query: &str) -> Option<usize> {
-    let terms = query
-        .split_whitespace()
-        .filter(|term| !term.contains(':'))
-        .map(|term| term.to_lowercase())
-        .filter(|term| !term.is_empty())
-        .collect::<Vec<_>>();
-
-    if terms.is_empty() {
-        return Some(0);
-    }
-
-    let content = event.content.to_lowercase();
-    let score = terms
-        .iter()
-        .map(|term| content.match_indices(term).count())
-        .sum::<usize>();
-
-    if score == 0 { None } else { Some(score) }
 }
 
 fn is_lower_hex_of_len(value: &str, len: usize) -> bool {
@@ -1515,46 +800,6 @@ fn is_auth_event_kind(kind: u64) -> bool {
     kind == 22242
 }
 
-fn event_has_protected_tag(event: &EventRecord) -> bool {
-    event
-        .tags
-        .iter()
-        .any(|tag| tag.len() == 1 && tag.first().map(String::as_str) == Some("-"))
-}
-
-fn validate_auth_event(event: &EventRecord, auth: &ConnectionAuth) -> Result<(), String> {
-    if !is_auth_event_kind(event.kind) {
-        return Err("invalid: AUTH event kind must be 22242".to_string());
-    }
-
-    let now = current_unix_timestamp();
-    if (event.created_at - now).abs() > 600 {
-        return Err("invalid: AUTH event created_at is too far from current time".to_string());
-    }
-
-    let relay_tag = event
-        .tags
-        .iter()
-        .find(|tag| tag.first().map(String::as_str) == Some("relay"))
-        .and_then(|tag| tag.get(1))
-        .ok_or_else(|| "invalid: AUTH event missing relay tag".to_string())?;
-    if relay_tag != &auth.relay_url {
-        return Err("invalid: AUTH event relay tag mismatch".to_string());
-    }
-
-    let challenge_tag = event
-        .tags
-        .iter()
-        .find(|tag| tag.first().map(String::as_str) == Some("challenge"))
-        .and_then(|tag| tag.get(1))
-        .ok_or_else(|| "invalid: AUTH event missing challenge tag".to_string())?;
-    if challenge_tag != &auth.challenge {
-        return Err("invalid: AUTH event challenge tag mismatch".to_string());
-    }
-
-    Ok(())
-}
-
 fn current_unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1571,6 +816,135 @@ fn parse_env_bool(key: &str, default: bool) -> bool {
         },
         Err(_) => default,
     }
+}
+
+fn parse_event_created_at(value: RawJsonValue<'_, '_>) -> Result<i64, String> {
+    if let Ok(created_at) = value.try_into() {
+        return Ok(created_at);
+    }
+
+    let raw = value.as_raw_str().to_string();
+    parse_scientific_notation_i64(&raw)
+        .ok_or_else(|| "invalid: created_at must be an integer".to_string())
+}
+
+fn parse_scientific_notation_i64(raw: &str) -> Option<i64> {
+    let value: f64 = raw.parse().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    if value.fract() != 0.0 {
+        return None;
+    }
+    if value < i64::MIN as f64 || value > i64::MAX as f64 {
+        return None;
+    }
+    Some(value as i64)
+}
+
+fn parse_tag_values(tag: RawJsonValue<'_, '_>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut values = tag.to_array().map_err(|e| format!("invalid: {e}"))?;
+
+    for v in &mut values {
+        let s: String = v.try_into().map_err(|e| format!("invalid: {e}"))?;
+        out.push(s);
+    }
+
+    Ok(out)
+}
+
+fn parse_event_field_raw(
+    event_json: &str,
+    field: &str,
+    start_pos: usize,
+) -> Result<String, String> {
+    let needle = format!("\"{field}\":");
+    let rel = event_json[start_pos..]
+        .find(&needle)
+        .ok_or_else(|| format!("invalid: missing field {field} in raw event"))?;
+    let mut i = start_pos + rel + needle.len();
+    let bytes = event_json.as_bytes();
+
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return Err(format!("invalid: missing field value for {field}"));
+    }
+
+    let start = i;
+    match bytes[i] as char {
+        '"' => {
+            i += 1;
+            let mut escaped = false;
+            while i < bytes.len() {
+                let ch = bytes[i] as char;
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    return Ok(event_json[start..=i].to_string());
+                }
+                i += 1;
+            }
+            Err(format!("invalid: unterminated string for field {field}"))
+        }
+        '[' => {
+            let mut depth = 0usize;
+            let mut in_string = false;
+            let mut escaped = false;
+            while i < bytes.len() {
+                let ch = bytes[i] as char;
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                } else {
+                    match ch {
+                        '"' => in_string = true,
+                        '[' => depth += 1,
+                        ']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Ok(event_json[start..=i].to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                i += 1;
+            }
+            Err(format!("invalid: unterminated array for field {field}"))
+        }
+        _ => {
+            while i < bytes.len() {
+                let ch = bytes[i] as char;
+                if ch == ',' || ch == '}' || ch.is_ascii_whitespace() {
+                    break;
+                }
+                i += 1;
+            }
+            Ok(event_json[start..i].to_string())
+        }
+    }
+}
+
+fn build_raw_serialized_event_data(event_json: &str) -> Result<String, String> {
+    let id_pos = event_json.find("\"id\":").unwrap_or(0);
+    let pubkey_raw = parse_event_field_raw(event_json, "pubkey", id_pos)?;
+    let created_at_raw = parse_event_field_raw(event_json, "created_at", id_pos)?;
+    let kind_raw = parse_event_field_raw(event_json, "kind", id_pos)?;
+    let tags_raw = parse_event_field_raw(event_json, "tags", id_pos)?;
+    let content_raw = parse_event_field_raw(event_json, "content", id_pos)?;
+    Ok(format!(
+        "[0,{pubkey_raw},{created_at_raw},{kind_raw},{tags_raw},{content_raw}]"
+    ))
 }
 
 fn event_expiration_timestamp(event: &EventRecord) -> Option<i64> {
@@ -1605,12 +979,10 @@ fn validate_nip65_relay_list_event(event: &EventRecord) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut has_r = false;
     for tag in &event.tags {
         if tag.first().map(String::as_str) != Some("r") {
             continue;
         }
-        has_r = true;
         if tag.len() < 2 {
             return Err("invalid: kind 10002 r tags must include relay URL".to_string());
         }
@@ -1620,10 +992,6 @@ fn validate_nip65_relay_list_event(event: &EventRecord) -> Result<(), String> {
         {
             return Err("invalid: kind 10002 r tag marker must be read or write".to_string());
         }
-    }
-
-    if !has_r {
-        return Err("invalid: kind 10002 must include at least one r tag".to_string());
     }
 
     Ok(())
@@ -2125,7 +1493,7 @@ mod tests {
             allow_protected_events: true,
         };
         let doc = relay_info_document(&cfg);
-        assert!(doc.contains("\"supported_nips\":[1,9,11,26,29,40,42,45,50,65,70]"));
+        assert!(doc.contains("\"supported_nips\":[1,4,9,11,26,29,40,42,45,50,59,65,70,94,96]"));
         assert!(doc.contains("\"restricted_writes\":true"));
     }
 
@@ -2459,14 +1827,10 @@ mod tests {
     }
 
     #[test]
-    fn kind_10002_requires_r_tags_with_valid_markers() {
+    fn kind_10002_accepts_non_r_tags_and_validates_markers_when_present() {
         let mut event = signed_event("relay list");
         event.kind = 10002;
-        event.tags = vec![vec![
-            "r".to_string(),
-            "wss://relay.example".to_string(),
-            "read".to_string(),
-        ]];
+        event.tags = vec![vec!["test".to_string()]];
         event.id = compute_event_id(&event);
         let secp = Secp256k1::new();
         let secret_key = SecretKey::from_byte_array([1u8; 32]).expect("valid test secret key");

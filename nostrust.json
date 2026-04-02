@@ -1,0 +1,8 @@
+{
+  "bind": "127.0.0.1:8080",
+  "store": "nostrust.db",
+  "relay_url": "ws://127.0.0.1:8080",
+  "allow_protected_events": false,
+  "min_pow_difficulty": 0,
+  "nip05_domain": null
+}

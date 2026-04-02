@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 use nojson::RawJsonValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocket;
 
-use crate::{DynError, Filter, RelayState};
+use crate::{ConnectionAuth, DynError, Filter, RelayState};
 
 use super::{
-    parse_filter, query_initial_events, send_closed, send_eose, send_event, send_notice,
+    parse_filter, query_initial_events_for_auth, send_closed, send_eose, send_event, send_notice,
     subscription_is_complete, validate_subscription_id,
 };
 
@@ -16,6 +16,7 @@ pub(crate) fn handle_req(
     ws: &mut WebSocket<TcpStream>,
     subscriptions: &mut HashMap<String, Vec<Filter>>,
     relay: &Arc<Mutex<RelayState>>,
+    auth: &ConnectionAuth,
     values: &[RawJsonValue<'_, '_>],
 ) -> Result<(), DynError> {
     if values.len() < 2 {
@@ -58,7 +59,7 @@ pub(crate) fn handle_req(
         let state = relay
             .lock()
             .map_err(|_| "error: relay state lock poisoned during REQ")?;
-        query_initial_events(&state, &filters)
+        query_initial_events_for_auth(&state, &filters, auth)
     };
 
     for event in initial_events {

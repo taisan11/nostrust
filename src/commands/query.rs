@@ -5,7 +5,7 @@ use std::sync::Arc;
 use nojson::RawJsonValue;
 
 use crate::{
-    EventRecord, Filter, KindClass, RelayState, classify_kind, current_unix_timestamp,
+    ConnectionAuth, EventRecord, Filter, KindClass, RelayState, classify_kind, current_unix_timestamp,
     is_event_expired, is_lower_hex_of_len, is_tag_filter_key,
 };
 
@@ -191,6 +191,17 @@ pub(crate) fn query_initial_events(state: &RelayState, filters: &[Filter]) -> Ve
     out
 }
 
+pub(crate) fn query_initial_events_for_auth(
+    state: &RelayState,
+    filters: &[Filter],
+    auth: &ConnectionAuth,
+) -> Vec<Arc<EventRecord>> {
+    query_initial_events(state, filters)
+        .into_iter()
+        .filter(|event| event_visible_to_auth(event, auth))
+        .collect()
+}
+
 fn compare_events_desc(a: &Arc<EventRecord>, b: &Arc<EventRecord>) -> Ordering {
     b.created_at
         .cmp(&a.created_at)
@@ -262,6 +273,44 @@ pub(crate) fn count_matching_events(state: &RelayState, filters: &[Filter]) -> u
     selected.len()
 }
 
+pub(crate) fn count_matching_events_for_auth(
+    state: &RelayState,
+    filters: &[Filter],
+    auth: &ConnectionAuth,
+) -> usize {
+    let mut selected = HashSet::new();
+
+    for filter in filters {
+        let matching = if let Some(ids) = &filter.ids {
+            ids.iter()
+                .filter_map(|id| {
+                    state
+                        .events_by_id
+                        .get(id)
+                        .or_else(|| state.archived_events_by_id.get(id))
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            state.events_by_id.values().cloned().collect::<Vec<_>>()
+        };
+
+        for event in matching {
+            if !state.deleted_event_ids.contains(&event.id)
+                && !event_blocked_by_address_tombstone(&event, &state.deleted_addresses)
+                && (filter.ids.is_some() || !event_is_superseded(&event, state))
+                && !is_event_expired(&event, current_unix_timestamp())
+                && event_matches_filter(&event, filter)
+                && event_visible_to_auth(&event, auth)
+            {
+                selected.insert(event.id.clone());
+            }
+        }
+    }
+
+    selected.len()
+}
+
 fn event_blocked_by_address_tombstone(
     event: &EventRecord,
     deleted_addresses: &HashMap<(u64, String, String), i64>,
@@ -307,6 +356,27 @@ pub(crate) fn matches_any_filter(event: &EventRecord, filters: &[Filter]) -> boo
     filters
         .iter()
         .any(|filter| event_matches_filter(event, filter))
+}
+
+pub(crate) fn matches_any_filter_for_auth(
+    event: &EventRecord,
+    filters: &[Filter],
+    auth: &ConnectionAuth,
+) -> bool {
+    event_visible_to_auth(event, auth) && matches_any_filter(event, filters)
+}
+
+pub(crate) fn event_visible_to_auth(event: &EventRecord, auth: &ConnectionAuth) -> bool {
+    if event.kind != 1059 {
+        return true;
+    }
+
+    event.tags.iter().any(|tag| {
+        tag.first().map(String::as_str) == Some("p")
+            && tag
+                .get(1)
+                .is_some_and(|pubkey| auth.is_authenticated(pubkey))
+    })
 }
 
 pub(crate) fn event_matches_filter(event: &EventRecord, filter: &Filter) -> bool {

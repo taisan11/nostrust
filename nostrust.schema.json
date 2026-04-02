@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/taisan11/nostrust/blob/main/nostrust.schema.json",
+  "title": "nostrust configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "bind": {
+      "type": "string",
+      "description": "TCP bind address for websocket and HTTP endpoints.",
+      "default": "127.0.0.1:8080",
+      "minLength": 1
+    },
+    "store": {
+      "type": "string",
+      "description": "Path to the SQLite/Turso local event store file.",
+      "default": "nostrust-events.db",
+      "minLength": 1
+    },
+    "relay_url": {
+      "type": "string",
+      "description": "Public relay URL used for AUTH relay tag checks and NIP metadata.",
+      "minLength": 1
+    },
+    "allow_protected_events": {
+      "type": "boolean",
+      "description": "Enable publishing protected events with '-' tag (requires AUTH).",
+      "default": false
+    },
+    "min_pow_difficulty": {
+      "type": "integer",
+      "description": "Minimum NIP-13 PoW difficulty for accepted events (leading zero bits in event id).",
+      "default": 0,
+      "minimum": 0,
+      "maximum": 255
+    },
+    "nip05_domain": {
+      "type": ["string", "null"],
+      "description": "Fixed domain for NIP-05 /.well-known/nostr.json responses. If omitted/null, Host header is used."
+    }
+  }
+}

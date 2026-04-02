@@ -4,16 +4,17 @@ use std::sync::{Arc, Mutex};
 use nojson::RawJsonValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocket;
 
-use crate::{DynError, RelayState};
+use crate::{ConnectionAuth, DynError, RelayState};
 
 use super::{
-    count_matching_events, parse_filter, send_closed, send_count, send_notice,
+    count_matching_events_for_auth, parse_filter, send_closed, send_count, send_notice,
     validate_subscription_id,
 };
 
 pub(crate) fn handle_count(
     ws: &mut WebSocket<TcpStream>,
     relay: &Arc<Mutex<RelayState>>,
+    auth: &ConnectionAuth,
     values: &[RawJsonValue<'_, '_>],
 ) -> Result<(), DynError> {
     if values.len() < 2 {
@@ -58,7 +59,7 @@ pub(crate) fn handle_count(
         let state = relay
             .lock()
             .map_err(|_| "error: relay state lock poisoned during COUNT")?;
-        count_matching_events(&state, &filters)
+        count_matching_events_for_auth(&state, &filters, auth)
     };
 
     send_count(ws, &query_id, count)?;

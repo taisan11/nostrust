@@ -56,12 +56,12 @@ pub(crate) fn handle_parsed_event_submission(
         apply_deletion_request(relay, &event)?;
     }
 
-    match publish_event(relay, event) {
+    match publish_event(relay, relay_config, event) {
         Ok(PublishOutcome::Accepted { event, message }) => {
             if should_persist_event(&event)
                 && let Err(err) = event_store.append_event(&event)
             {
-                eprintln!("persistence error: {err}");
+                crate::log_error(format!("persistence error: {err}"));
                 send_notice(ws, &format!("warning: persistence failed: {err}"))?;
             }
             send_ok(ws, &event.id, true, &message)?;

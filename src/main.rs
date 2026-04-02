@@ -20,7 +20,7 @@ use crate::commands::{
     query_initial_events, search_score, subscription_is_complete, validate_auth_event,
     validate_subscription_id,
 };
-use crate::commands::{forward_live_events, handle_text_frame, send_auth_challenge};
+use crate::commands::{event_has_protected_tag, forward_live_events, handle_text_frame, send_auth_challenge};
 use crate::crypto::{
     compute_event_id_from_serialized, verify_delegation_signature, verify_event_signature,
 };

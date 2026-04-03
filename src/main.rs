@@ -16,7 +16,7 @@ mod persistence;
 
 #[cfg(test)]
 use crate::commands::{
-    count_matching_events, event_has_protected_tag, event_matches_filter, parse_filter,
+    count_matching_events, event_matches_filter, parse_filter,
     query_initial_events, search_score, subscription_is_complete, validate_auth_event,
     validate_subscription_id,
 };

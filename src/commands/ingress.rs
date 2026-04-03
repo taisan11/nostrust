@@ -349,7 +349,7 @@ fn build_negentropy_storage(
     filter: &Filter,
     auth: &ConnectionAuth,
 ) -> Result<NegentropyStorageVector, DynError> {
-    let events = query_initial_events_for_auth(state, &[filter.clone()], auth);
+    let events = query_initial_events_for_auth(state, std::slice::from_ref(filter), auth);
     let mut storage = NegentropyStorageVector::with_capacity(events.len());
 
     for event in events {

@@ -240,6 +240,7 @@ fn combined_search_score(event: &EventRecord, filters: &[Filter]) -> usize {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 pub(crate) fn count_matching_events(state: &RelayState, filters: &[Filter]) -> usize {
     let mut selected = HashSet::new();
 

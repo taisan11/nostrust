@@ -1077,6 +1077,7 @@ dependencies = [
 name = "nostrust"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "negentropy",
  "nojson",
  "secp256k1",

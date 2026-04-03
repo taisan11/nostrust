@@ -5,8 +5,8 @@ use std::sync::Arc;
 use nojson::RawJsonValue;
 
 use crate::{
-    ConnectionAuth, EventRecord, Filter, KindClass, RelayState, classify_kind, current_unix_timestamp,
-    is_event_expired, is_lower_hex_of_len, is_tag_filter_key,
+    ConnectionAuth, EventRecord, Filter, KindClass, RelayState, classify_kind,
+    current_unix_timestamp, is_event_expired, is_lower_hex_of_len, is_tag_filter_key,
 };
 
 pub(crate) fn parse_filter(value: RawJsonValue<'_, '_>) -> Result<Filter, String> {
@@ -144,7 +144,10 @@ pub(crate) fn extract_event_id(value: RawJsonValue<'_, '_>) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn query_initial_events(state: &RelayState, filters: &[Filter]) -> Vec<Arc<EventRecord>> {
+pub(crate) fn query_initial_events(
+    state: &RelayState,
+    filters: &[Filter],
+) -> Vec<Arc<EventRecord>> {
     let mut selected: HashMap<String, Arc<EventRecord>> = HashMap::new();
 
     for filter in filters {
@@ -164,8 +167,12 @@ pub(crate) fn query_initial_events(state: &RelayState, filters: &[Filter]) -> Ve
 
         matching.retain(|event| {
             !state.deleted_event_ids.contains(&event.id)
-                && event_blocked_by_address_tombstone(event, &state.deleted_addresses)
-                    == false
+                && !state.banned_events.contains_key(&event.id)
+                && !state.banned_pubkeys.contains_key(&event.pubkey)
+                && (state.allowed_pubkeys.is_empty()
+                    || state.allowed_pubkeys.contains_key(&event.pubkey))
+                && (state.allowed_kinds.is_empty() || state.allowed_kinds.contains(&event.kind))
+                && event_blocked_by_address_tombstone(event, &state.deleted_addresses) == false
                 && (filter.ids.is_some() || !event_is_superseded(event, state))
                 && !is_event_expired(event, current_unix_timestamp())
                 && event_matches_filter(event, filter)
@@ -216,7 +223,9 @@ fn compare_events_for_filter(
     if let Some(search) = &filter.search {
         let a_score = search_score(a, search).unwrap_or(0);
         let b_score = search_score(b, search).unwrap_or(0);
-        b_score.cmp(&a_score).then_with(|| compare_events_desc(a, b))
+        b_score
+            .cmp(&a_score)
+            .then_with(|| compare_events_desc(a, b))
     } else {
         compare_events_desc(a, b)
     }
@@ -229,7 +238,9 @@ fn compare_events_for_filters(
 ) -> Ordering {
     let a_score = combined_search_score(a, filters);
     let b_score = combined_search_score(b, filters);
-    b_score.cmp(&a_score).then_with(|| compare_events_desc(a, b))
+    b_score
+        .cmp(&a_score)
+        .then_with(|| compare_events_desc(a, b))
 }
 
 fn combined_search_score(event: &EventRecord, filters: &[Filter]) -> usize {
@@ -261,6 +272,11 @@ pub(crate) fn count_matching_events(state: &RelayState, filters: &[Filter]) -> u
 
         for event in matching {
             if !state.deleted_event_ids.contains(&event.id)
+                && !state.banned_events.contains_key(&event.id)
+                && !state.banned_pubkeys.contains_key(&event.pubkey)
+                && (state.allowed_pubkeys.is_empty()
+                    || state.allowed_pubkeys.contains_key(&event.pubkey))
+                && (state.allowed_kinds.is_empty() || state.allowed_kinds.contains(&event.kind))
                 && !event_blocked_by_address_tombstone(&event, &state.deleted_addresses)
                 && (filter.ids.is_some() || !event_is_superseded(&event, state))
                 && !is_event_expired(&event, current_unix_timestamp())
@@ -298,6 +314,11 @@ pub(crate) fn count_matching_events_for_auth(
 
         for event in matching {
             if !state.deleted_event_ids.contains(&event.id)
+                && !state.banned_events.contains_key(&event.id)
+                && !state.banned_pubkeys.contains_key(&event.pubkey)
+                && (state.allowed_pubkeys.is_empty()
+                    || state.allowed_pubkeys.contains_key(&event.pubkey))
+                && (state.allowed_kinds.is_empty() || state.allowed_kinds.contains(&event.kind))
                 && !event_blocked_by_address_tombstone(&event, &state.deleted_addresses)
                 && (filter.ids.is_some() || !event_is_superseded(&event, state))
                 && !is_event_expired(&event, current_unix_timestamp())

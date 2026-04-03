@@ -30,15 +30,21 @@ NIPs whose documents in `../nips/` include the `` `relay` `` tag:
 
 Current `supported_nips` advertised by this relay:
 
-`1, 4, 5, 9, 11, 13, 17, 26, 29, 40, 42, 43, 45, 50, 59, 62, 65, 66, 70, 77, 94, 96`
+`1, 4, 5, 9, 11, 13, 17, 26, 29, 40, 42, 43, 45, 50, 57, 59, 62, 65, 66, 70, 77, 86, 94, 96`
 
 Alignment summary:
 
 - Relay-tagged and currently advertised: `01, 04, 09, 11, 13, 17, 26, 29, 40, 42, 43, 45, 50, 59, 62, 66, 70, 77`
 - Relay-tagged but not currently advertised: `(none)`
-- Advertised but not relay-tagged in header metadata: `5, 65, 94, 96`
+- Advertised but not relay-tagged in header metadata: `5, 57, 65, 86, 94, 96`
 
 Notes:
 
 - `1` and `4` in `supported_nips` correspond to NIP-01 and NIP-04.
 - This project currently keeps the existing advertised list and does not auto-sync it from documents.
+
+## Newly added support
+
+- **NIP-57 (Lightning Zaps):** kind `9734` and `9735` validation rules are enforced.
+- **NIP-86 (Relay Management API):** HTTP JSON-RPC endpoint over the relay URI with NIP-98 authorization (`Authorization: Nostr ...`) and moderation/state management methods.
+- **NIP-B7 (Blossom media):** kind `10063` user server-list validation is enforced (`server` tags with `http(s)` URLs).

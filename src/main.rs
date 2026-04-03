@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
-use std::io::Write as _;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::{Read as _, Write as _};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use nojson::{DisplayJson, JsonFormatter, RawJson, RawJsonValue};
+use sha2::{Digest, Sha256};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message, accept};
 
 mod commands;
@@ -16,11 +19,12 @@ mod persistence;
 
 #[cfg(test)]
 use crate::commands::{
-    count_matching_events, event_matches_filter, parse_filter,
-    query_initial_events, search_score, subscription_is_complete, validate_auth_event,
-    validate_subscription_id,
+    count_matching_events, event_matches_filter, parse_filter, query_initial_events, search_score,
+    subscription_is_complete, validate_auth_event, validate_subscription_id,
 };
-use crate::commands::{event_has_protected_tag, forward_live_events, handle_text_frame, send_auth_challenge};
+use crate::commands::{
+    event_has_protected_tag, forward_live_events, handle_text_frame, send_auth_challenge,
+};
 use crate::crypto::{
     compute_event_id_from_serialized, verify_delegation_signature, verify_event_signature,
 };
@@ -86,7 +90,7 @@ struct Filter {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RelayState {
     events_by_id: HashMap<String, Arc<EventRecord>>,
     archived_events_by_id: HashMap<String, Arc<EventRecord>>,
@@ -96,6 +100,14 @@ struct RelayState {
     replaceable_index: HashMap<(String, u64), String>,
     addressable_index: HashMap<(u64, String, String), String>,
     subscribers: Vec<Sender<Arc<EventRecord>>>,
+    banned_pubkeys: BTreeMap<String, String>,
+    allowed_pubkeys: BTreeMap<String, String>,
+    banned_events: BTreeMap<String, String>,
+    blocked_ips: BTreeMap<String, String>,
+    allowed_kinds: BTreeSet<u64>,
+    relay_name: String,
+    relay_description: String,
+    relay_icon: String,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +170,29 @@ impl Default for RuntimeConfig {
             allow_protected_events: false,
             min_pow_difficulty: 0,
             nip05_domain: None,
+        }
+    }
+}
+
+impl Default for RelayState {
+    fn default() -> Self {
+        Self {
+            events_by_id: HashMap::new(),
+            archived_events_by_id: HashMap::new(),
+            deleted_event_ids: HashSet::new(),
+            deleted_addresses: HashMap::new(),
+            deleted_pubkeys_until: HashMap::new(),
+            replaceable_index: HashMap::new(),
+            addressable_index: HashMap::new(),
+            subscribers: Vec::new(),
+            banned_pubkeys: BTreeMap::new(),
+            allowed_pubkeys: BTreeMap::new(),
+            banned_events: BTreeMap::new(),
+            blocked_ips: BTreeMap::new(),
+            allowed_kinds: BTreeSet::new(),
+            relay_name: "nostrust".to_string(),
+            relay_description: "Simple Rust Nostr relay".to_string(),
+            relay_icon: String::new(),
         }
     }
 }
@@ -280,7 +315,12 @@ fn handle_connection(
     event_store: Arc<EventStore>,
     relay_config: RelayConfig,
 ) -> Result<(), DynError> {
-    if maybe_serve_http_request(&mut stream, &relay, &relay_config)? {
+    if maybe_serve_http_request(&mut stream, peer.ip(), &relay, &relay_config)? {
+        return Ok(());
+    }
+
+    if blocked_ip_reason(&relay, &peer.ip().to_string())?.is_some() {
+        log_warn(format!("blocked websocket connection from {peer}"));
         return Ok(());
     }
 
@@ -422,6 +462,7 @@ fn parse_runtime_config_json(text: &str) -> Result<RuntimeConfig, String> {
 
 fn maybe_serve_http_request(
     stream: &mut TcpStream,
+    peer_ip: IpAddr,
     relay: &Arc<Mutex<RelayState>>,
     relay_config: &RelayConfig,
 ) -> Result<bool, DynError> {
@@ -433,7 +474,10 @@ fn maybe_serve_http_request(
 
     let request = String::from_utf8_lossy(&peek_buf[..read_len]);
     let request_lower = request.to_ascii_lowercase();
-    if !request.starts_with("GET ") && !request.starts_with("OPTIONS ") {
+    if !request.starts_with("GET ")
+        && !request.starts_with("OPTIONS ")
+        && !request.starts_with("POST ")
+    {
         return Ok(false);
     }
 
@@ -443,118 +487,957 @@ fn maybe_serve_http_request(
         return Ok(false);
     }
 
-    if request.starts_with("OPTIONS ") {
-        let response = "HTTP/1.1 204 No Content\r\n\
-                        Access-Control-Allow-Origin: *\r\n\
-                        Access-Control-Allow-Headers: *\r\n\
-                        Access-Control-Allow-Methods: GET, OPTIONS\r\n\
-                        Content-Length: 0\r\n\
-                        Connection: close\r\n\r\n";
-        stream.write_all(response.as_bytes())?;
-        stream.flush()?;
+    let request_bytes = read_http_request_bytes(stream)?;
+    let parsed = match parse_http_request(&request_bytes) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let body = format!("invalid: {err}\n");
+            send_http_response(
+                stream,
+                400,
+                "Bad Request",
+                "text/plain; charset=utf-8",
+                &body,
+                &[],
+            )?;
+            return Ok(true);
+        }
+    };
+
+    if blocked_ip_reason(relay, &peer_ip.to_string())?.is_some() {
+        send_http_response(
+            stream,
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            "blocked: ip is blocked\n",
+            &[],
+        )?;
         return Ok(true);
     }
 
-    let request_line = request.lines().next().unwrap_or_default();
-    if request_line.starts_with("GET /.well-known/nostr.json") {
-        let name = match parse_query_param(request_line, "name") {
-            Ok(value) => value.unwrap_or_else(|| "_".to_string()),
-            Err(err) => {
-                let body = format!("invalid: {err}\n");
-                let response = format!(
-                    "HTTP/1.1 400 Bad Request\r\n\
-                     Content-Type: text/plain; charset=utf-8\r\n\
-                     Access-Control-Allow-Origin: *\r\n\
-                     Access-Control-Allow-Headers: *\r\n\
-                     Access-Control-Allow-Methods: GET, OPTIONS\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes())?;
-                stream.flush()?;
+    if parsed.method == "OPTIONS" {
+        send_http_response(
+            stream,
+            204,
+            "No Content",
+            "text/plain; charset=utf-8",
+            "",
+            &[("Access-Control-Allow-Methods", "GET, OPTIONS, POST")],
+        )?;
+        return Ok(true);
+    }
+
+    if parsed.method == "POST" {
+        let content_type = parsed
+            .headers
+            .get("content-type")
+            .map(|v| v.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !content_type.contains("application/nostr+json+rpc") {
+            send_http_response(
+                stream,
+                415,
+                "Unsupported Media Type",
+                "text/plain; charset=utf-8",
+                "NIP-86 requires Content-Type: application/nostr+json+rpc\n",
+                &[],
+            )?;
+            return Ok(true);
+        }
+
+        let body = String::from_utf8(parsed.body.clone())
+            .map_err(|_| "invalid: request body must be UTF-8 JSON".to_string())?;
+        match handle_nip86_http_request(relay, relay_config, &parsed, &body) {
+            Ok(response_body) => {
+                send_http_response(
+                    stream,
+                    200,
+                    "OK",
+                    "application/json; charset=utf-8",
+                    &response_body,
+                    &[],
+                )?;
                 return Ok(true);
             }
-        };
-        match nip05_document(relay, relay_config, &name, request.lines()) {
-            Ok(body) => {
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\n\
-                     Content-Type: application/json; charset=utf-8\r\n\
-                     Access-Control-Allow-Origin: *\r\n\
-                     Access-Control-Allow-Headers: *\r\n\
-                     Access-Control-Allow-Methods: GET, OPTIONS\r\n\
-                     Cache-Control: no-store\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes())?;
-                stream.flush()?;
+            Err(Nip86HttpError::Unauthorized(msg)) => {
+                send_http_response(
+                    stream,
+                    401,
+                    "Unauthorized",
+                    "text/plain; charset=utf-8",
+                    &format!("{msg}\n"),
+                    &[],
+                )?;
                 return Ok(true);
             }
-            Err(err) => {
-                let body = format!("invalid: {err}\n");
-                let response = format!(
-                    "HTTP/1.1 400 Bad Request\r\n\
-                     Content-Type: text/plain; charset=utf-8\r\n\
-                     Access-Control-Allow-Origin: *\r\n\
-                     Access-Control-Allow-Headers: *\r\n\
-                     Access-Control-Allow-Methods: GET, OPTIONS\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(response.as_bytes())?;
-                stream.flush()?;
+            Err(Nip86HttpError::BadRequest(msg)) => {
+                let body =
+                    nip86_response_json(Nip86Result::Bool(false), Some(format!("invalid: {msg}")));
+                send_http_response(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "application/json; charset=utf-8",
+                    &body,
+                    &[],
+                )?;
+                return Ok(true);
+            }
+            Err(Nip86HttpError::Internal(msg)) => {
+                let body =
+                    nip86_response_json(Nip86Result::Bool(false), Some(format!("error: {msg}")));
+                send_http_response(
+                    stream,
+                    500,
+                    "Internal Server Error",
+                    "application/json; charset=utf-8",
+                    &body,
+                    &[],
+                )?;
                 return Ok(true);
             }
         }
     }
 
-    if !request_accepts_nip11(&request_lower) {
-        let body = "NIP-11 requires Accept: application/nostr+json header\n";
-        let response = format!(
-            "HTTP/1.1 406 Not Acceptable\r\n\
-             Content-Type: text/plain; charset=utf-8\r\n\
-             Access-Control-Allow-Origin: *\r\n\
-             Access-Control-Allow-Headers: *\r\n\
-             Access-Control-Allow-Methods: GET, OPTIONS\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes())?;
-        stream.flush()?;
+    if parsed.method != "GET" {
+        return Ok(false);
+    }
+
+    if parsed.target.starts_with("/.well-known/nostr.json") {
+        let request_line = format!("GET {} HTTP/1.1", parsed.target);
+        let name = match parse_query_param(&request_line, "name") {
+            Ok(value) => value.unwrap_or_else(|| "_".to_string()),
+            Err(err) => {
+                send_http_response(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "text/plain; charset=utf-8",
+                    &format!("invalid: {err}\n"),
+                    &[],
+                )?;
+                return Ok(true);
+            }
+        };
+        match nip05_document(
+            relay,
+            relay_config,
+            &name,
+            parsed.headers.get("host").map(String::as_str),
+        ) {
+            Ok(body) => {
+                send_http_response(
+                    stream,
+                    200,
+                    "OK",
+                    "application/json; charset=utf-8",
+                    &body,
+                    &[("Cache-Control", "no-store")],
+                )?;
+                return Ok(true);
+            }
+            Err(err) => {
+                send_http_response(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "text/plain; charset=utf-8",
+                    &format!("invalid: {err}\n"),
+                    &[],
+                )?;
+                return Ok(true);
+            }
+        }
+    }
+
+    if !request_accepts_nip11(&parsed.headers) {
+        send_http_response(
+            stream,
+            406,
+            "Not Acceptable",
+            "text/plain; charset=utf-8",
+            "NIP-11 requires Accept: application/nostr+json header\n",
+            &[],
+        )?;
         return Ok(true);
     }
 
-    let body = relay_info_document(relay_config);
-    let response = format!(
-        "HTTP/1.1 200 OK\r\n\
-         Content-Type: application/nostr+json; charset=utf-8\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Headers: *\r\n\
-         Access-Control-Allow-Methods: GET, OPTIONS\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream.write_all(response.as_bytes())?;
-    stream.flush()?;
+    let body = relay_info_document(relay, relay_config)?;
+    send_http_response(
+        stream,
+        200,
+        "OK",
+        "application/nostr+json; charset=utf-8",
+        &body,
+        &[],
+    )?;
 
     Ok(true)
 }
 
-fn request_accepts_nip11(request_lower: &str) -> bool {
-    request_lower.lines().any(|line| {
-        line.trim_start().starts_with("accept:") && line.contains("application/nostr+json")
+fn request_accepts_nip11(headers: &BTreeMap<String, String>) -> bool {
+    headers
+        .get("accept")
+        .map(|line| line.to_ascii_lowercase())
+        .is_some_and(|line| line.contains("application/nostr+json"))
+}
+
+#[derive(Debug)]
+struct HttpRequest {
+    method: String,
+    target: String,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+fn read_http_request_bytes(stream: &mut TcpStream) -> Result<Vec<u8>, DynError> {
+    stream.set_read_timeout(Some(Duration::from_millis(1000)))?;
+    let mut data = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut header_end = None;
+    let mut content_length = 0usize;
+
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                if header_end.is_none()
+                    && let Some(pos) = find_subslice(&data, b"\r\n\r\n")
+                {
+                    header_end = Some(pos + 4);
+                    let headers_text = String::from_utf8_lossy(&data[..pos + 4]);
+                    content_length = parse_content_length_from_headers(&headers_text)?;
+                }
+                if let Some(end) = header_end
+                    && data.len() >= end + content_length
+                {
+                    break;
+                }
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if header_end.is_none() {
+                    return Err("invalid: timed out reading HTTP request headers".into());
+                }
+                if let Some(end) = header_end
+                    && data.len() >= end + content_length
+                {
+                    break;
+                }
+                return Err("invalid: timed out reading HTTP request body".into());
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    stream.set_read_timeout(None)?;
+
+    if find_subslice(&data, b"\r\n\r\n").is_none() {
+        return Err("invalid: malformed HTTP request".into());
+    }
+
+    Ok(data)
+}
+
+fn parse_content_length_from_headers(headers_text: &str) -> Result<usize, DynError> {
+    for line in headers_text.lines().skip(1) {
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            let len = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "invalid: Content-Length must be a decimal number")?;
+            return Ok(len);
+        }
+    }
+    Ok(0)
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn parse_http_request(data: &[u8]) -> Result<HttpRequest, String> {
+    let Some(header_end) = find_subslice(data, b"\r\n\r\n") else {
+        return Err("malformed HTTP request".to_string());
+    };
+    let header_bytes = &data[..header_end];
+    let body = data[header_end + 4..].to_vec();
+    let header_text =
+        std::str::from_utf8(header_bytes).map_err(|_| "HTTP headers must be UTF-8".to_string())?;
+
+    let mut lines = header_text.lines();
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "missing HTTP request line".to_string())?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| "missing HTTP method".to_string())?
+        .to_string();
+    let target = parts
+        .next()
+        .ok_or_else(|| "missing HTTP target".to_string())?
+        .to_string();
+    let _version = parts
+        .next()
+        .ok_or_else(|| "missing HTTP version".to_string())?;
+
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err("malformed HTTP header line".to_string());
+        };
+        let key = name.trim().to_ascii_lowercase();
+        let val = value.trim().to_string();
+        headers
+            .entry(key)
+            .and_modify(|existing: &mut String| {
+                if !existing.is_empty() {
+                    existing.push_str(", ");
+                }
+                existing.push_str(&val);
+            })
+            .or_insert(val);
+    }
+
+    Ok(HttpRequest {
+        method,
+        target,
+        headers,
+        body,
     })
+}
+
+fn send_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<(), DynError> {
+    let mut headers = String::new();
+    headers.push_str(&format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: {content_type}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Headers: Authorization, Content-Type, Accept\r\n\
+         Access-Control-Allow-Methods: GET, OPTIONS, POST\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n",
+        body.len()
+    ));
+    for (name, value) in extra_headers {
+        headers.push_str(name);
+        headers.push_str(": ");
+        headers.push_str(value);
+        headers.push_str("\r\n");
+    }
+    headers.push_str("\r\n");
+    headers.push_str(body);
+
+    stream.write_all(headers.as_bytes())?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn blocked_ip_reason(relay: &Arc<Mutex<RelayState>>, ip: &str) -> Result<Option<String>, String> {
+    let state = relay
+        .lock()
+        .map_err(|_| "relay state lock poisoned while checking blocked IP".to_string())?;
+    Ok(state.blocked_ips.get(ip).cloned())
+}
+
+#[derive(Debug)]
+enum Nip86HttpError {
+    Unauthorized(String),
+    BadRequest(String),
+    Internal(String),
+}
+
+#[derive(Debug)]
+enum Nip86Result {
+    Bool(bool),
+    Methods(Vec<String>),
+    Pubkeys(Vec<PubkeyReasonEntry>),
+    Events(Vec<EventReasonEntry>),
+    Ips(Vec<IpReasonEntry>),
+    Kinds(Vec<u64>),
+}
+
+impl DisplayJson for Nip86Result {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        match self {
+            Nip86Result::Bool(v) => f.value(*v),
+            Nip86Result::Methods(values) => f.value(values),
+            Nip86Result::Pubkeys(values) => f.value(values),
+            Nip86Result::Events(values) => f.value(values),
+            Nip86Result::Ips(values) => f.value(values),
+            Nip86Result::Kinds(values) => f.value(values),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PubkeyReasonEntry {
+    pubkey: String,
+    reason: String,
+}
+
+impl DisplayJson for PubkeyReasonEntry {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("pubkey", &self.pubkey)?;
+            if !self.reason.is_empty() {
+                f.member("reason", &self.reason)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EventReasonEntry {
+    id: String,
+    reason: String,
+}
+
+impl DisplayJson for EventReasonEntry {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("id", &self.id)?;
+            if !self.reason.is_empty() {
+                f.member("reason", &self.reason)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IpReasonEntry {
+    ip: String,
+    reason: String,
+}
+
+impl DisplayJson for IpReasonEntry {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("ip", &self.ip)?;
+            if !self.reason.is_empty() {
+                f.member("reason", &self.reason)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+fn nip86_response_json(result: Nip86Result, error: Option<String>) -> String {
+    nojson::json(|f| {
+        f.object(|f| {
+            f.member("result", &result)?;
+            if let Some(error) = error.as_ref() {
+                f.member("error", error)?;
+            }
+            Ok(())
+        })
+    })
+    .to_string()
+}
+
+fn supported_nip86_methods() -> Vec<String> {
+    [
+        "supportedmethods",
+        "banpubkey",
+        "unbanpubkey",
+        "listbannedpubkeys",
+        "allowpubkey",
+        "unallowpubkey",
+        "listallowedpubkeys",
+        "listeventsneedingmoderation",
+        "allowevent",
+        "banevent",
+        "listbannedevents",
+        "changerelayname",
+        "changerelaydescription",
+        "changerelayicon",
+        "allowkind",
+        "disallowkind",
+        "listallowedkinds",
+        "blockip",
+        "unblockip",
+        "listblockedips",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
+fn handle_nip86_http_request(
+    relay: &Arc<Mutex<RelayState>>,
+    relay_config: &RelayConfig,
+    request: &HttpRequest,
+    body: &str,
+) -> Result<String, Nip86HttpError> {
+    validate_nip98_authorization(relay_config, request, body)?;
+
+    let raw = RawJson::parse(body).map_err(|e| Nip86HttpError::BadRequest(format!("{e}")))?;
+    let method: String = raw
+        .value()
+        .to_member("method")
+        .map_err(|_| Nip86HttpError::BadRequest("method is required".to_string()))?
+        .required()
+        .map_err(|_| Nip86HttpError::BadRequest("method is required".to_string()))?
+        .try_into()
+        .map_err(|_| Nip86HttpError::BadRequest("method must be a string".to_string()))?;
+    let params_raw = raw
+        .value()
+        .to_member("params")
+        .map_err(|_| Nip86HttpError::BadRequest("params is required".to_string()))?
+        .required()
+        .map_err(|_| Nip86HttpError::BadRequest("params is required".to_string()))?;
+    let params = params_raw
+        .to_array()
+        .map_err(|_| Nip86HttpError::BadRequest("params must be an array".to_string()))?
+        .collect::<Vec<_>>();
+
+    let result = apply_nip86_method(relay, &method, &params)?;
+    Ok(nip86_response_json(result, None))
+}
+
+fn validate_nip98_authorization(
+    relay_config: &RelayConfig,
+    request: &HttpRequest,
+    body: &str,
+) -> Result<(), Nip86HttpError> {
+    let auth_header = request
+        .headers
+        .get("authorization")
+        .ok_or_else(|| Nip86HttpError::Unauthorized("missing Authorization header".to_string()))?;
+    let Some(encoded) = auth_header.strip_prefix("Nostr ") else {
+        return Err(Nip86HttpError::Unauthorized(
+            "Authorization header must use Nostr scheme".to_string(),
+        ));
+    };
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded.trim()))
+        .map_err(|_| {
+            Nip86HttpError::Unauthorized("Authorization event is not valid base64".to_string())
+        })?;
+    let event_text = String::from_utf8(decoded).map_err(|_| {
+        Nip86HttpError::Unauthorized("Authorization event must be UTF-8 JSON".to_string())
+    })?;
+    let raw = RawJson::parse(&event_text).map_err(|_| {
+        Nip86HttpError::Unauthorized("Authorization event is not valid JSON".to_string())
+    })?;
+    let event = parse_event(raw.value())
+        .map_err(|_| Nip86HttpError::Unauthorized("Authorization event is invalid".to_string()))?;
+
+    if event.kind != 27235 {
+        return Err(Nip86HttpError::Unauthorized(
+            "Authorization event kind must be 27235".to_string(),
+        ));
+    }
+
+    let now = current_unix_timestamp();
+    if (event.created_at - now).abs() > 60 {
+        return Err(Nip86HttpError::Unauthorized(
+            "Authorization event created_at is outside allowed window".to_string(),
+        ));
+    }
+
+    let method_tag = first_tag_value(&event, "method").ok_or_else(|| {
+        Nip86HttpError::Unauthorized("Authorization event missing method tag".to_string())
+    })?;
+    if method_tag != request.method {
+        return Err(Nip86HttpError::Unauthorized(
+            "Authorization event method tag mismatch".to_string(),
+        ));
+    }
+
+    let expected_request_url = request
+        .headers
+        .get("host")
+        .map(|host| format!("http://{}{}", host.trim(), request.target))
+        .unwrap_or_else(|| relay_config.relay_url.replace("ws://", "http://"));
+    let u_tag = first_tag_value(&event, "u").ok_or_else(|| {
+        Nip86HttpError::Unauthorized("Authorization event missing u tag".to_string())
+    })?;
+    if u_tag != relay_config.relay_url && u_tag != expected_request_url {
+        return Err(Nip86HttpError::Unauthorized(
+            "Authorization event u tag mismatch".to_string(),
+        ));
+    }
+
+    let payload_tag = first_tag_value(&event, "payload").ok_or_else(|| {
+        Nip86HttpError::Unauthorized("Authorization event missing payload tag".to_string())
+    })?;
+    let payload_hash = hex_sha256(body.as_bytes());
+    if payload_tag != payload_hash {
+        return Err(Nip86HttpError::Unauthorized(
+            "Authorization event payload tag mismatch".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn apply_nip86_method(
+    relay: &Arc<Mutex<RelayState>>,
+    method: &str,
+    params: &[RawJsonValue<'_, '_>],
+) -> Result<Nip86Result, Nip86HttpError> {
+    match method {
+        "supportedmethods" => {
+            if !params.is_empty() {
+                return Err(Nip86HttpError::BadRequest(
+                    "supportedmethods expects [] params".to_string(),
+                ));
+            }
+            Ok(Nip86Result::Methods(supported_nip86_methods()))
+        }
+        "banpubkey" => {
+            let (pubkey, reason) = parse_pubkey_with_reason(params)?;
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.banned_pubkeys.insert(pubkey, reason);
+            Ok(Nip86Result::Bool(true))
+        }
+        "unbanpubkey" => {
+            let (pubkey, _) = parse_pubkey_with_reason(params)?;
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.banned_pubkeys.remove(&pubkey);
+            Ok(Nip86Result::Bool(true))
+        }
+        "listbannedpubkeys" => {
+            ensure_empty_params(method, params)?;
+            let state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            let out = state
+                .banned_pubkeys
+                .iter()
+                .map(|(pubkey, reason)| PubkeyReasonEntry {
+                    pubkey: pubkey.clone(),
+                    reason: reason.clone(),
+                })
+                .collect();
+            Ok(Nip86Result::Pubkeys(out))
+        }
+        "allowpubkey" => {
+            let (pubkey, reason) = parse_pubkey_with_reason(params)?;
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.allowed_pubkeys.insert(pubkey, reason);
+            Ok(Nip86Result::Bool(true))
+        }
+        "unallowpubkey" => {
+            let (pubkey, _) = parse_pubkey_with_reason(params)?;
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.allowed_pubkeys.remove(&pubkey);
+            Ok(Nip86Result::Bool(true))
+        }
+        "listallowedpubkeys" => {
+            ensure_empty_params(method, params)?;
+            let state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            let out = state
+                .allowed_pubkeys
+                .iter()
+                .map(|(pubkey, reason)| PubkeyReasonEntry {
+                    pubkey: pubkey.clone(),
+                    reason: reason.clone(),
+                })
+                .collect();
+            Ok(Nip86Result::Pubkeys(out))
+        }
+        "listeventsneedingmoderation" => {
+            ensure_empty_params(method, params)?;
+            Ok(Nip86Result::Events(Vec::new()))
+        }
+        "allowevent" => {
+            let (event_id, _) = parse_event_id_with_reason(params)?;
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.banned_events.remove(&event_id);
+            Ok(Nip86Result::Bool(true))
+        }
+        "banevent" => {
+            let (event_id, reason) = parse_event_id_with_reason(params)?;
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.banned_events.insert(event_id, reason);
+            Ok(Nip86Result::Bool(true))
+        }
+        "listbannedevents" => {
+            ensure_empty_params(method, params)?;
+            let state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            let out = state
+                .banned_events
+                .iter()
+                .map(|(id, reason)| EventReasonEntry {
+                    id: id.clone(),
+                    reason: reason.clone(),
+                })
+                .collect();
+            Ok(Nip86Result::Events(out))
+        }
+        "changerelayname" => {
+            let value = parse_single_string_param(method, params)?;
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.relay_name = value;
+            Ok(Nip86Result::Bool(true))
+        }
+        "changerelaydescription" => {
+            let value = parse_single_string_param(method, params)?;
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.relay_description = value;
+            Ok(Nip86Result::Bool(true))
+        }
+        "changerelayicon" => {
+            let value = parse_single_string_param(method, params)?;
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.relay_icon = value;
+            Ok(Nip86Result::Bool(true))
+        }
+        "allowkind" => {
+            let kind = parse_single_kind_param(method, params)?;
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.allowed_kinds.insert(kind);
+            Ok(Nip86Result::Bool(true))
+        }
+        "disallowkind" => {
+            let kind = parse_single_kind_param(method, params)?;
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.allowed_kinds.remove(&kind);
+            Ok(Nip86Result::Bool(true))
+        }
+        "listallowedkinds" => {
+            ensure_empty_params(method, params)?;
+            let state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            Ok(Nip86Result::Kinds(
+                state.allowed_kinds.iter().copied().collect(),
+            ))
+        }
+        "blockip" => {
+            let (ip, reason) = parse_ip_with_reason(params)?;
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.blocked_ips.insert(ip, reason);
+            Ok(Nip86Result::Bool(true))
+        }
+        "unblockip" => {
+            let ip = parse_single_string_param(method, params)?;
+            if ip.parse::<IpAddr>().is_err() {
+                return Err(Nip86HttpError::BadRequest(
+                    "unblockip first param must be an IP address".to_string(),
+                ));
+            }
+            let mut state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            state.blocked_ips.remove(&ip);
+            Ok(Nip86Result::Bool(true))
+        }
+        "listblockedips" => {
+            ensure_empty_params(method, params)?;
+            let state = relay
+                .lock()
+                .map_err(|_| Nip86HttpError::Internal("relay state lock poisoned".to_string()))?;
+            let out = state
+                .blocked_ips
+                .iter()
+                .map(|(ip, reason)| IpReasonEntry {
+                    ip: ip.clone(),
+                    reason: reason.clone(),
+                })
+                .collect();
+            Ok(Nip86Result::Ips(out))
+        }
+        _ => Err(Nip86HttpError::BadRequest(format!(
+            "unsupported method: {method}"
+        ))),
+    }
+}
+
+fn ensure_empty_params(
+    method: &str,
+    params: &[RawJsonValue<'_, '_>],
+) -> Result<(), Nip86HttpError> {
+    if params.is_empty() {
+        Ok(())
+    } else {
+        Err(Nip86HttpError::BadRequest(format!(
+            "{method} expects [] params"
+        )))
+    }
+}
+
+fn parse_single_string_param(
+    method: &str,
+    params: &[RawJsonValue<'_, '_>],
+) -> Result<String, Nip86HttpError> {
+    if params.len() != 1 {
+        return Err(Nip86HttpError::BadRequest(format!(
+            "{method} expects exactly one string param"
+        )));
+    }
+    params[0]
+        .try_into()
+        .map_err(|_| Nip86HttpError::BadRequest(format!("{method} param must be a string")))
+}
+
+fn parse_single_kind_param(
+    method: &str,
+    params: &[RawJsonValue<'_, '_>],
+) -> Result<u64, Nip86HttpError> {
+    if params.len() != 1 {
+        return Err(Nip86HttpError::BadRequest(format!(
+            "{method} expects exactly one numeric kind param"
+        )));
+    }
+    let kind: u64 = params[0]
+        .try_into()
+        .map_err(|_| Nip86HttpError::BadRequest(format!("{method} param must be a number")))?;
+    if kind > 65535 {
+        return Err(Nip86HttpError::BadRequest(
+            "kind must be between 0 and 65535".to_string(),
+        ));
+    }
+    Ok(kind)
+}
+
+fn parse_pubkey_with_reason(
+    params: &[RawJsonValue<'_, '_>],
+) -> Result<(String, String), Nip86HttpError> {
+    if params.is_empty() || params.len() > 2 {
+        return Err(Nip86HttpError::BadRequest(
+            "method expects [\"<pubkey>\", \"<optional-reason>\"]".to_string(),
+        ));
+    }
+    let pubkey: String = params[0]
+        .try_into()
+        .map_err(|_| Nip86HttpError::BadRequest("pubkey must be a string".to_string()))?;
+    if !is_lower_hex_of_len(&pubkey, 64) {
+        return Err(Nip86HttpError::BadRequest(
+            "pubkey must be 64-char lowercase hex".to_string(),
+        ));
+    }
+    let reason = if params.len() == 2 {
+        params[1]
+            .try_into()
+            .map_err(|_| Nip86HttpError::BadRequest("reason must be a string".to_string()))?
+    } else {
+        String::new()
+    };
+    Ok((pubkey, reason))
+}
+
+fn parse_event_id_with_reason(
+    params: &[RawJsonValue<'_, '_>],
+) -> Result<(String, String), Nip86HttpError> {
+    if params.is_empty() || params.len() > 2 {
+        return Err(Nip86HttpError::BadRequest(
+            "method expects [\"<event-id>\", \"<optional-reason>\"]".to_string(),
+        ));
+    }
+    let event_id: String = params[0]
+        .try_into()
+        .map_err(|_| Nip86HttpError::BadRequest("event id must be a string".to_string()))?;
+    if !is_lower_hex_of_len(&event_id, 64) {
+        return Err(Nip86HttpError::BadRequest(
+            "event id must be 64-char lowercase hex".to_string(),
+        ));
+    }
+    let reason = if params.len() == 2 {
+        params[1]
+            .try_into()
+            .map_err(|_| Nip86HttpError::BadRequest("reason must be a string".to_string()))?
+    } else {
+        String::new()
+    };
+    Ok((event_id, reason))
+}
+
+fn parse_ip_with_reason(
+    params: &[RawJsonValue<'_, '_>],
+) -> Result<(String, String), Nip86HttpError> {
+    if params.is_empty() || params.len() > 2 {
+        return Err(Nip86HttpError::BadRequest(
+            "blockip expects [\"<ip-address>\", \"<optional-reason>\"]".to_string(),
+        ));
+    }
+    let ip: String = params[0]
+        .try_into()
+        .map_err(|_| Nip86HttpError::BadRequest("ip must be a string".to_string()))?;
+    if ip.parse::<IpAddr>().is_err() {
+        return Err(Nip86HttpError::BadRequest(
+            "ip must be a valid IPv4 or IPv6 address".to_string(),
+        ));
+    }
+    let reason = if params.len() == 2 {
+        params[1]
+            .try_into()
+            .map_err(|_| Nip86HttpError::BadRequest("reason must be a string".to_string()))?
+    } else {
+        String::new()
+    };
+    Ok((ip, reason))
+}
+
+fn first_tag_value<'a>(event: &'a EventRecord, tag_name: &str) -> Option<&'a str> {
+    event
+        .tags
+        .iter()
+        .find(|tag| tag.first().map(String::as_str) == Some(tag_name))
+        .and_then(|tag| tag.get(1))
+        .map(String::as_str)
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(&mut out, "{:02x}", b);
+    }
+    out
 }
 
 fn parse_query_param(request_line: &str, key: &str) -> Result<Option<String>, String> {
@@ -623,13 +1506,13 @@ fn nip05_document<'a>(
     relay: &Arc<Mutex<RelayState>>,
     relay_config: &RelayConfig,
     requested_name: &str,
-    request_lines: std::str::Lines<'a>,
+    host_header: Option<&'a str>,
 ) -> Result<String, String> {
     validate_nip05_name(requested_name)?;
     let domain = if let Some(domain) = relay_config.nip05_domain.as_ref() {
         domain.clone()
     } else {
-        request_host_domain(request_lines)?
+        request_host_domain(host_header)?
     };
 
     let state = relay
@@ -742,20 +1625,11 @@ fn validate_nip05_name(name: &str) -> Result<(), String> {
     }
 }
 
-fn request_host_domain<'a>(mut lines: std::str::Lines<'a>) -> Result<String, String> {
-    let _ = lines.next();
-    for line in lines {
-        if line.trim().is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("host")
-        {
-            return normalize_domain(value.trim());
-        }
-    }
-
-    Err("Host header is required for NIP-05 when NOSTR_NIP05_DOMAIN is unset".to_string())
+fn request_host_domain(host_header: Option<&str>) -> Result<String, String> {
+    let host = host_header.ok_or_else(|| {
+        "Host header is required for NIP-05 when NOSTR_NIP05_DOMAIN is unset".to_string()
+    })?;
+    normalize_domain(host)
 }
 
 fn normalize_domain(raw: &str) -> Result<String, String> {
@@ -830,27 +1704,59 @@ impl DisplayJson for Nip05Relays<'_> {
     }
 }
 
-fn relay_info_document(relay_config: &RelayConfig) -> String {
-    format!(
-        concat!(
-            "{{",
-            "\"name\":\"nostrust\",",
-            "\"description\":\"Simple Rust Nostr relay\",",
-            "\"supported_nips\":[1,4,5,9,11,13,17,26,29,40,42,43,45,50,59,62,65,66,70,77,94,96],",
-            "\"software\":\"https://github.com/taisan11/nostrust\",",
-            "\"version\":\"{}\",",
-            "\"limitation\":{{",
-            "\"auth_required\":false,",
-            "\"min_pow_difficulty\":{},",
-            "\"restricted_writes\":{},",
-            "\"max_subid_length\":64",
-            "}}",
-            "}}"
-        ),
-        env!("CARGO_PKG_VERSION"),
-        relay_config.min_pow_difficulty,
-        relay_config.allow_protected_events
-    )
+fn relay_info_document(
+    relay: &Arc<Mutex<RelayState>>,
+    relay_config: &RelayConfig,
+) -> Result<String, String> {
+    let state = relay
+        .lock()
+        .map_err(|_| "relay state lock poisoned during relay info request".to_string())?;
+    let supported_nips = vec![
+        1u64, 4, 5, 9, 11, 13, 17, 26, 29, 40, 42, 43, 45, 50, 57, 59, 62, 65, 66, 70, 77, 86, 94,
+        96,
+    ];
+    let limitations = RelayLimitations {
+        auth_required: false,
+        min_pow_difficulty: relay_config.min_pow_difficulty,
+        restricted_writes: relay_config.allow_protected_events,
+        max_subid_length: 64,
+    };
+
+    let doc = nojson::json(|f| {
+        f.object(|f| {
+            f.member("name", &state.relay_name)?;
+            f.member("description", &state.relay_description)?;
+            f.member("supported_nips", &supported_nips)?;
+            f.member("software", "https://github.com/taisan11/nostrust")?;
+            f.member("version", env!("CARGO_PKG_VERSION"))?;
+            if !state.relay_icon.is_empty() {
+                f.member("icon", &state.relay_icon)?;
+            }
+            f.member("limitation", limitations)
+        })
+    })
+    .to_string();
+
+    Ok(doc)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RelayLimitations {
+    auth_required: bool,
+    min_pow_difficulty: u8,
+    restricted_writes: bool,
+    max_subid_length: u64,
+}
+
+impl DisplayJson for RelayLimitations {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("auth_required", self.auth_required)?;
+            f.member("min_pow_difficulty", self.min_pow_difficulty)?;
+            f.member("restricted_writes", self.restricted_writes)?;
+            f.member("max_subid_length", self.max_subid_length)
+        })
+    }
 }
 
 fn escape_control_chars_in_json_strings(input: &str, preserve_invalid_escapes: bool) -> String {
@@ -956,7 +1862,9 @@ fn load_persisted_events(
             continue;
         }
 
-        if event.kind == 5 && let Err(err) = apply_deletion_request(relay, &event) {
+        if event.kind == 5
+            && let Err(err) = apply_deletion_request(relay, &event)
+        {
             log_warn(format!(
                 "skipping persisted line {} in {}: failed to apply deletion ({err})",
                 line_idx + 1,
@@ -1012,6 +1920,19 @@ fn publish_event(
     let mut state = relay
         .lock()
         .map_err(|_| "relay state lock poisoned during EVENT processing".to_string())?;
+
+    if state.banned_pubkeys.contains_key(&event_arc.pubkey) {
+        return Err("blocked: pubkey is banned".to_string());
+    }
+    if !state.allowed_pubkeys.is_empty() && !state.allowed_pubkeys.contains_key(&event_arc.pubkey) {
+        return Err("blocked: pubkey is not in allowlist".to_string());
+    }
+    if state.banned_events.contains_key(&event_arc.id) {
+        return Err("blocked: event id is banned".to_string());
+    }
+    if !state.allowed_kinds.is_empty() && !state.allowed_kinds.contains(&event_arc.kind) {
+        return Err("blocked: kind is not allowed".to_string());
+    }
 
     if state.events_by_id.contains_key(&event_id) {
         return Ok(PublishOutcome::DuplicateAccepted {
@@ -1288,6 +2209,8 @@ fn parse_event_with_options(
     validate_nip43_event(&event)?;
     validate_nip62_vanish_event(&event)?;
     validate_nip66_event(&event)?;
+    validate_nip57_event(&event)?;
+    validate_nip_b7_event(&event)?;
     validate_nip65_relay_list_event(&event)?;
     Ok(event)
 }
@@ -1566,7 +2489,10 @@ fn validate_nip17_dm_relay_list_event(event: &EventRecord) -> Result<(), String>
     if relay_tags.is_empty() {
         return Err("invalid: kind 10050 must include at least one relay tag".to_string());
     }
-    if relay_tags.iter().any(|tag| tag.get(1).is_none_or(|url| url.is_empty())) {
+    if relay_tags
+        .iter()
+        .any(|tag| tag.get(1).is_none_or(|url| url.is_empty()))
+    {
         return Err("invalid: kind 10050 relay tags must include relay URL".to_string());
     }
 
@@ -1618,7 +2544,9 @@ fn validate_nip43_event(event: &EventRecord) -> Result<(), String> {
             }
             let now = current_unix_timestamp();
             if (event.created_at - now).abs() > 600 {
-                return Err("invalid: kind 28934 created_at is too far from current time".to_string());
+                return Err(
+                    "invalid: kind 28934 created_at is too far from current time".to_string(),
+                );
             }
         }
         28935 => {
@@ -1639,7 +2567,9 @@ fn validate_nip43_event(event: &EventRecord) -> Result<(), String> {
             }
             let now = current_unix_timestamp();
             if (event.created_at - now).abs() > 600 {
-                return Err("invalid: kind 28936 created_at is too far from current time".to_string());
+                return Err(
+                    "invalid: kind 28936 created_at is too far from current time".to_string(),
+                );
             }
         }
         _ => {}
@@ -1660,7 +2590,10 @@ fn validate_nip62_vanish_event(event: &EventRecord) -> Result<(), String> {
     if relay_tags.is_empty() {
         return Err("invalid: vanish request must include at least one relay tag".to_string());
     }
-    if relay_tags.iter().any(|tag| tag.get(1).is_none_or(|value| value.is_empty())) {
+    if relay_tags
+        .iter()
+        .any(|tag| tag.get(1).is_none_or(|value| value.is_empty()))
+    {
         return Err("invalid: vanish relay tags must include value".to_string());
     }
 
@@ -1683,10 +2616,7 @@ fn validate_nip66_event(event: &EventRecord) -> Result<(), String> {
 
     for tag in &event.tags {
         if let Some(key) = tag.first().map(String::as_str)
-            && (key == "rtt-open"
-                || key == "rtt-read"
-                || key == "rtt-write"
-                || key == "frequency")
+            && (key == "rtt-open" || key == "rtt-read" || key == "rtt-write" || key == "frequency")
         {
             let Some(value) = tag.get(1) else {
                 return Err(format!("invalid: {key} tag must include numeric value"));
@@ -1694,6 +2624,110 @@ fn validate_nip66_event(event: &EventRecord) -> Result<(), String> {
             if value.parse::<u64>().is_err() {
                 return Err(format!("invalid: {key} tag must be numeric"));
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_nip57_event(event: &EventRecord) -> Result<(), String> {
+    match event.kind {
+        9734 => {
+            if !event
+                .tags
+                .iter()
+                .any(|tag| tag.first().map(String::as_str) == Some("p") && tag.len() >= 2)
+            {
+                return Err("invalid: kind 9734 must include p tag".to_string());
+            }
+
+            let relay_tag = event
+                .tags
+                .iter()
+                .find(|tag| tag.first().map(String::as_str) == Some("relays"))
+                .ok_or_else(|| "invalid: kind 9734 must include relays tag".to_string())?;
+            if relay_tag.len() < 2 {
+                return Err(
+                    "invalid: kind 9734 relays tag must include at least one relay URL".to_string(),
+                );
+            }
+
+            if event
+                .tags
+                .iter()
+                .any(|tag| tag.first().map(String::as_str) == Some("amount"))
+            {
+                let amount_tag = event
+                    .tags
+                    .iter()
+                    .find(|tag| tag.first().map(String::as_str) == Some("amount"))
+                    .expect("checked by any above");
+                let Some(raw_amount) = amount_tag.get(1) else {
+                    return Err(
+                        "invalid: kind 9734 amount tag must include millisats string".to_string(),
+                    );
+                };
+                if raw_amount.parse::<u64>().is_err() {
+                    return Err(
+                        "invalid: kind 9734 amount tag must be numeric millisats".to_string()
+                    );
+                }
+            }
+        }
+        9735 => {
+            if !event.content.is_empty() {
+                return Err("invalid: kind 9735 content must be empty".to_string());
+            }
+            if !event
+                .tags
+                .iter()
+                .any(|tag| tag.first().map(String::as_str) == Some("p") && tag.len() >= 2)
+            {
+                return Err("invalid: kind 9735 must include p tag".to_string());
+            }
+            if !event
+                .tags
+                .iter()
+                .any(|tag| tag.first().map(String::as_str) == Some("bolt11") && tag.len() >= 2)
+            {
+                return Err("invalid: kind 9735 must include bolt11 tag".to_string());
+            }
+            if !event.tags.iter().any(|tag| {
+                tag.first().map(String::as_str) == Some("description")
+                    && tag.get(1).is_some_and(|v| !v.is_empty())
+            }) {
+                return Err("invalid: kind 9735 must include description tag".to_string());
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn validate_nip_b7_event(event: &EventRecord) -> Result<(), String> {
+    if event.kind != 10063 {
+        return Ok(());
+    }
+
+    let server_tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("server"))
+        .collect::<Vec<_>>();
+    if server_tags.is_empty() {
+        return Err("invalid: kind 10063 must include at least one server tag".to_string());
+    }
+
+    for tag in server_tags {
+        let Some(url) = tag.get(1) else {
+            return Err("invalid: kind 10063 server tags must include URL".to_string());
+        };
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(
+                "invalid: kind 10063 server tag URL must start with http:// or https://"
+                    .to_string(),
+            );
         }
     }
 
@@ -2279,15 +3313,16 @@ mod tests {
 
     #[test]
     fn relay_info_document_includes_nip11_and_nip42() {
+        let relay = Arc::new(Mutex::new(RelayState::default()));
         let cfg = RelayConfig {
             relay_url: "ws://127.0.0.1:8080".to_string(),
             allow_protected_events: true,
             min_pow_difficulty: 0,
             nip05_domain: None,
         };
-        let doc = relay_info_document(&cfg);
+        let doc = relay_info_document(&relay, &cfg).expect("relay info should build");
         assert!(doc.contains(
-            "\"supported_nips\":[1,4,5,9,11,13,17,26,29,40,42,43,45,50,59,62,65,66,70,77,94,96]"
+            "\"supported_nips\":[1,4,5,9,11,13,17,26,29,40,42,43,45,50,57,59,62,65,66,70,77,86,94,96]"
         ));
         assert!(doc.contains("\"restricted_writes\":true"));
         assert!(doc.contains("\"min_pow_difficulty\":0"));
@@ -2295,11 +3330,13 @@ mod tests {
 
     #[test]
     fn request_accepts_nip11_checks_accept_header() {
-        let req_ok = "get / http/1.1\r\nhost: localhost\r\naccept: application/nostr+json\r\n\r\n";
-        let req_ng = "get / http/1.1\r\nhost: localhost\r\naccept: application/json\r\n\r\n";
+        let mut ok = BTreeMap::new();
+        ok.insert("accept".to_string(), "application/nostr+json".to_string());
+        let mut ng = BTreeMap::new();
+        ng.insert("accept".to_string(), "application/json".to_string());
 
-        assert!(request_accepts_nip11(req_ok));
-        assert!(!request_accepts_nip11(req_ng));
+        assert!(request_accepts_nip11(&ok));
+        assert!(!request_accepts_nip11(&ng));
     }
 
     #[test]
@@ -2747,13 +3784,8 @@ mod tests {
             min_pow_difficulty: 0,
             nip05_domain: Some("example.com".to_string()),
         };
-        let body = nip05_document(
-            &relay,
-            &cfg,
-            "bob",
-            "GET /.well-known/nostr.json HTTP/1.1\r\n".lines(),
-        )
-        .expect("nip05 doc should build");
+        let body = nip05_document(&relay, &cfg, "bob", Some("example.com"))
+            .expect("nip05 doc should build");
         assert!(body.contains("\"names\":{\"bob\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}"));
         assert!(body.contains("\"relays\":{\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\":[\"wss://relay.example.com\"]}"));
     }
@@ -2770,7 +3802,10 @@ mod tests {
         event.kind = 10050;
         event.tags = vec![];
         let err = validate_nip17_dm_relay_list_event(&event).expect_err("must fail");
-        assert_eq!(err, "invalid: kind 10050 must include at least one relay tag");
+        assert_eq!(
+            err,
+            "invalid: kind 10050 must include at least one relay tag"
+        );
     }
 
     #[test]
@@ -2778,7 +3813,10 @@ mod tests {
         let mut event = signed_event("join");
         event.kind = 28934;
         event.created_at = current_unix_timestamp();
-        event.tags = vec![vec!["-".to_string()], vec!["claim".to_string(), "invite".to_string()]];
+        event.tags = vec![
+            vec!["-".to_string()],
+            vec!["claim".to_string(), "invite".to_string()],
+        ];
         assert!(validate_nip43_event(&event).is_ok());
 
         event.tags = vec![vec!["claim".to_string(), "invite".to_string()]];
@@ -2792,7 +3830,10 @@ mod tests {
         event.kind = 62;
         event.tags = vec![];
         let err = validate_nip62_vanish_event(&event).expect_err("must fail");
-        assert_eq!(err, "invalid: vanish request must include at least one relay tag");
+        assert_eq!(
+            err,
+            "invalid: vanish request must include at least one relay tag"
+        );
     }
 
     #[test]

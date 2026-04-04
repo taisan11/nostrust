@@ -275,8 +275,8 @@ async fn main() -> Result<(), DynError> {
         nip05_domain: runtime_config.nip05_domain.clone(),
     };
     let relay = Arc::new(Mutex::new(RelayState::default()));
-    let event_store = Arc::new(EventStore::open(store_path.clone())?);
-    let loaded_count = load_persisted_events(&event_store, &relay, &relay_config)?;
+    let event_store = Arc::new(EventStore::open(store_path.clone()).await?);
+    let loaded_count = load_persisted_events(&event_store, &relay, &relay_config).await?;
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
     log_info(format!(
@@ -1664,12 +1664,12 @@ fn hex_digit(v: u8) -> char {
     HEX[v as usize] as char
 }
 
-fn load_persisted_events(
+async fn load_persisted_events(
     event_store: &EventStore,
     relay: &Arc<Mutex<RelayState>>,
     relay_config: &RelayConfig,
 ) -> Result<usize, DynError> {
-    let payloads = event_store.load_event_payloads()?;
+    let payloads = event_store.load_event_payloads().await?;
     let mut loaded = 0usize;
 
     for (line_idx, payload) in payloads.iter().enumerate() {

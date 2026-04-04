@@ -61,7 +61,7 @@ pub(crate) async fn handle_parsed_event_submission(
     match publish_event(relay, relay_config, event) {
         Ok(PublishOutcome::Accepted { event, message }) => {
             if should_persist_event(&event)
-                && let Err(err) = event_store.append_event(&event)
+                && let Err(err) = event_store.append_event(&event).await
             {
                 crate::log_error(format!("persistence error: {err}"));
                 send_notice(ws, &format!("warning: persistence failed: {err}")).await?;

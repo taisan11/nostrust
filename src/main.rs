@@ -2305,97 +2305,25 @@ fn parse_tag_values(tag: RawJsonValue<'_, '_>) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn parse_event_field_raw(
-    event_json: &str,
-    field: &str,
-    start_pos: usize,
-) -> Result<String, String> {
-    let needle = format!("\"{field}\":");
-    let rel = event_json[start_pos..]
-        .find(&needle)
-        .ok_or_else(|| format!("invalid: missing field {field} in raw event"))?;
-    let mut i = start_pos + rel + needle.len();
-    let bytes = event_json.as_bytes();
-
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() {
-        return Err(format!("invalid: missing field value for {field}"));
-    }
-
-    let start = i;
-    match bytes[i] as char {
-        '"' => {
-            i += 1;
-            let mut escaped = false;
-            while i < bytes.len() {
-                let ch = bytes[i] as char;
-                if escaped {
-                    escaped = false;
-                } else if ch == '\\' {
-                    escaped = true;
-                } else if ch == '"' {
-                    return Ok(event_json[start..=i].to_string());
-                }
-                i += 1;
-            }
-            Err(format!("invalid: unterminated string for field {field}"))
-        }
-        '[' => {
-            let mut depth = 0usize;
-            let mut in_string = false;
-            let mut escaped = false;
-            while i < bytes.len() {
-                let ch = bytes[i] as char;
-                if in_string {
-                    if escaped {
-                        escaped = false;
-                    } else if ch == '\\' {
-                        escaped = true;
-                    } else if ch == '"' {
-                        in_string = false;
-                    }
-                } else {
-                    match ch {
-                        '"' => in_string = true,
-                        '[' => depth += 1,
-                        ']' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                return Ok(event_json[start..=i].to_string());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                i += 1;
-            }
-            Err(format!("invalid: unterminated array for field {field}"))
-        }
-        _ => {
-            while i < bytes.len() {
-                let ch = bytes[i] as char;
-                if ch == ',' || ch == '}' || ch.is_ascii_whitespace() {
-                    break;
-                }
-                i += 1;
-            }
-            Ok(event_json[start..i].to_string())
-        }
-    }
-}
-
 fn build_raw_serialized_event_data(event_json: &str) -> Result<String, String> {
-    let id_pos = event_json.find("\"id\":").unwrap_or(0);
-    let pubkey_raw = parse_event_field_raw(event_json, "pubkey", id_pos)?;
-    let created_at_raw = parse_event_field_raw(event_json, "created_at", id_pos)?;
-    let kind_raw = parse_event_field_raw(event_json, "kind", id_pos)?;
-    let tags_raw = parse_event_field_raw(event_json, "tags", id_pos)?;
-    let content_raw = parse_event_field_raw(event_json, "content", id_pos)?;
+    let raw = RawJson::parse(event_json).map_err(|e| format!("invalid: {e}"))?;
+    let event = raw.value();
+    let pubkey_raw = parse_raw_event_field(event, "pubkey")?;
+    let created_at_raw = parse_raw_event_field(event, "created_at")?;
+    let kind_raw = parse_raw_event_field(event, "kind")?;
+    let tags_raw = parse_raw_event_field(event, "tags")?;
+    let content_raw = parse_raw_event_field(event, "content")?;
     Ok(format!(
         "[0,{pubkey_raw},{created_at_raw},{kind_raw},{tags_raw},{content_raw}]"
     ))
+}
+
+fn parse_raw_event_field(event: RawJsonValue<'_, '_>, field: &str) -> Result<String, String> {
+    let member = event.to_member(field).map_err(|e| format!("invalid: {e}"))?;
+    let value = member
+        .required()
+        .map_err(|_| format!("invalid: missing field {field} in raw event"))?;
+    Ok(value.as_raw_str().to_string())
 }
 
 fn event_expiration_timestamp(event: &EventRecord) -> Option<i64> {
@@ -3217,6 +3145,29 @@ mod tests {
         let err = parse_event(raw.value()).expect_err("id mismatch should fail");
 
         assert!(err.starts_with("invalid: event id"));
+    }
+
+    #[test]
+    fn raw_serialized_event_data_accepts_pubkey_before_id() {
+        let event = signed_event("hello nostr");
+        let json = format!(
+            r#"{{"kind":{},"pubkey":"{}","id":"{}","created_at":{},"tags":[["e","{}"]],"content":"{}","sig":"{}"}}"#,
+            event.kind,
+            event.pubkey,
+            event.id,
+            event.created_at,
+            event.tags[0][1],
+            event.content,
+            event.sig
+        );
+        let raw = RawJson::parse(&json).expect("json parses");
+        let raw_serialized =
+            build_raw_serialized_event_data(&json).expect("raw serialized data should build");
+        let parsed = parse_event_with_options(raw.value(), false, Some(&raw_serialized))
+            .expect("event should parse");
+
+        assert_eq!(parsed.id, event.id);
+        assert_eq!(parsed.pubkey, event.pubkey);
     }
 
     #[test]

@@ -1,7 +1,6 @@
-use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
-use tokio_tungstenite::tungstenite::protocol::WebSocket;
+use axum::extract::ws::WebSocket;
 
 use crate::{
     ConnectionAuth, DynError, EventRecord, EventStore, PublishOutcome, RelayConfig, RelayState,
@@ -11,8 +10,8 @@ use crate::{
 
 use super::{send_notice, send_ok};
 
-pub(crate) fn handle_parsed_event_submission(
-    ws: &mut WebSocket<TcpStream>,
+pub(crate) async fn handle_parsed_event_submission(
+    ws: &mut WebSocket,
     relay: &Arc<Mutex<RelayState>>,
     event_store: &Arc<EventStore>,
     relay_config: &RelayConfig,
@@ -26,7 +25,8 @@ pub(crate) fn handle_parsed_event_submission(
             &event.id,
             false,
             "invalid: AUTH command must be used for kind 22242 events",
-        )?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -37,7 +37,8 @@ pub(crate) fn handle_parsed_event_submission(
                 &event.id,
                 false,
                 "restricted: protected events are disabled on this relay",
-            )?;
+            )
+            .await?;
             return Ok(());
         }
 
@@ -47,7 +48,8 @@ pub(crate) fn handle_parsed_event_submission(
                 &event.id,
                 false,
                 "auth-required: this event may only be published by its author",
-            )?;
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -62,12 +64,12 @@ pub(crate) fn handle_parsed_event_submission(
                 && let Err(err) = event_store.append_event(&event)
             {
                 crate::log_error(format!("persistence error: {err}"));
-                send_notice(ws, &format!("warning: persistence failed: {err}"))?;
+                send_notice(ws, &format!("warning: persistence failed: {err}")).await?;
             }
-            send_ok(ws, &event.id, true, &message)?;
+            send_ok(ws, &event.id, true, &message).await?;
         }
         Ok(PublishOutcome::DuplicateAccepted { event_id, message }) => {
-            send_ok(ws, &event_id, true, &message)?;
+            send_ok(ws, &event_id, true, &message).await?;
         }
         Err(err) => {
             let fallback_id = if event_id_hint.is_empty() {
@@ -75,7 +77,7 @@ pub(crate) fn handle_parsed_event_submission(
             } else {
                 event_id_hint
             };
-            send_ok(ws, fallback_id, false, &format!("error: {err}"))?;
+            send_ok(ws, fallback_id, false, &format!("error: {err}")).await?;
         }
     }
 
@@ -89,7 +91,10 @@ pub(crate) fn event_has_protected_tag(event: &EventRecord) -> bool {
         .any(|tag| tag.len() == 1 && tag.first().map(String::as_str) == Some("-"))
 }
 
-pub(crate) fn validate_auth_event(event: &EventRecord, auth: &ConnectionAuth) -> Result<(), String> {
+pub(crate) fn validate_auth_event(
+    event: &EventRecord,
+    auth: &ConnectionAuth,
+) -> Result<(), String> {
     if !is_auth_event_kind(event.kind) {
         return Err("invalid: AUTH event kind must be 22242".to_string());
     }

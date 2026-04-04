@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use secp256k1::{Secp256k1, XOnlyPublicKey, schnorr::Signature};
 use sha2::{Digest, Sha256};
 
-use crate::EventRecord;
+use crate::{EventRecord, RelayError};
 
 pub fn serialize_event_data(event: &EventRecord) -> String {
     nojson::array(|f| {
@@ -35,17 +35,17 @@ pub fn compute_event_id_from_serialized(serialized: &str) -> String {
     bytes_to_hex(&digest)
 }
 
-fn from_hex_nibble(ch: u8) -> Result<u8, String> {
+fn from_hex_nibble(ch: u8) -> Result<u8, RelayError> {
     match ch {
         b'0'..=b'9' => Ok(ch - b'0'),
         b'a'..=b'f' => Ok(ch - b'a' + 10),
-        _ => Err("invalid: non-hex character encountered".to_string()),
+        _ => Err(RelayError::invalid("non-hex character encountered")),
     }
 }
 
-pub fn hex_to_fixed<const N: usize>(hex: &str) -> Result<[u8; N], String> {
+pub fn hex_to_fixed<const N: usize>(hex: &str) -> Result<[u8; N], RelayError> {
     if hex.len() != N * 2 {
-        return Err(format!("invalid: expected {} hex chars", N * 2));
+        return Err(RelayError::invalid(format!("expected {} hex chars", N * 2)));
     }
 
     let mut out = [0u8; N];
@@ -60,32 +60,31 @@ pub fn hex_to_fixed<const N: usize>(hex: &str) -> Result<[u8; N], String> {
     Ok(out)
 }
 
-pub fn verify_event_signature(event: &EventRecord) -> Result<(), String> {
+pub fn verify_event_signature(event: &EventRecord) -> Result<(), RelayError> {
     let id_bytes = hex_to_fixed::<32>(&event.id)?;
     let sig_bytes = hex_to_fixed::<64>(&event.sig)?;
     let pubkey_bytes = hex_to_fixed::<32>(&event.pubkey)?;
 
     let pubkey = XOnlyPublicKey::from_byte_array(pubkey_bytes)
-        .map_err(|_| "invalid: pubkey is not a valid x-only secp256k1 key".to_string())?;
+        .map_err(|_| RelayError::invalid("pubkey is not a valid x-only secp256k1 key"))?;
     let signature = Signature::from_byte_array(sig_bytes);
     let secp = Secp256k1::verification_only();
 
     secp.verify_schnorr(&signature, &id_bytes, &pubkey)
-        .map_err(|_| "invalid: bad event signature".to_string())
+        .map_err(|_| RelayError::invalid("bad event signature"))
 }
-
 
 pub fn verify_delegation_signature(
     delegator_pubkey: &str,
     delegatee_pubkey: &str,
     conditions: &str,
     token: &str,
-) -> Result<(), String> {
+) -> Result<(), RelayError> {
     let pubkey_bytes = hex_to_fixed::<32>(delegator_pubkey)?;
     let sig_bytes = hex_to_fixed::<64>(token)?;
 
     let pubkey = XOnlyPublicKey::from_byte_array(pubkey_bytes).map_err(|_| {
-        "invalid: delegation pubkey is not a valid x-only secp256k1 key".to_string()
+        RelayError::invalid("delegation pubkey is not a valid x-only secp256k1 key")
     })?;
     let signature = Signature::from_byte_array(sig_bytes);
     let secp = Secp256k1::verification_only();
@@ -96,5 +95,5 @@ pub fn verify_delegation_signature(
     digest_bytes.copy_from_slice(&digest);
 
     secp.verify_schnorr(&signature, &digest_bytes, &pubkey)
-        .map_err(|_| "invalid: bad delegation signature".to_string())
+        .map_err(|_| RelayError::invalid("bad delegation signature"))
 }

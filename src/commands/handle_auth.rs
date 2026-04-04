@@ -1,14 +1,12 @@
-use std::net::TcpStream;
-
+use axum::extract::ws::WebSocket;
 use nojson::RawJsonValue;
-use tokio_tungstenite::tungstenite::protocol::WebSocket;
 
 use crate::{ConnectionAuth, DynError, parse_event};
 
 use super::{extract_event_id, send_ok, validate_auth_event};
 
-pub(crate) fn handle_auth(
-    ws: &mut WebSocket<TcpStream>,
+pub(crate) async fn handle_auth(
+    ws: &mut WebSocket,
     auth: &mut ConnectionAuth,
     values: &[RawJsonValue<'_, '_>],
 ) -> Result<(), DynError> {
@@ -18,7 +16,8 @@ pub(crate) fn handle_auth(
             "",
             false,
             "invalid: AUTH must contain exactly one event object",
-        )?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -26,7 +25,7 @@ pub(crate) fn handle_auth(
     let event = match parse_event(values[1]) {
         Ok(event) => event,
         Err(err) => {
-            send_ok(ws, &event_id_hint, false, &err)?;
+            send_ok(ws, &event_id_hint, false, &err).await?;
             return Ok(());
         }
     };
@@ -34,10 +33,10 @@ pub(crate) fn handle_auth(
     match validate_auth_event(&event, auth) {
         Ok(()) => {
             auth.authenticated_pubkeys.insert(event.pubkey.clone());
-            send_ok(ws, &event.id, true, "")?;
+            send_ok(ws, &event.id, true, "").await?;
         }
         Err(err) => {
-            send_ok(ws, &event.id, false, &err)?;
+            send_ok(ws, &event.id, false, &err).await?;
         }
     }
 

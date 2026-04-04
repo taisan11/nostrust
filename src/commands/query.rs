@@ -172,7 +172,7 @@ pub(crate) fn query_initial_events(
                 && (state.allowed_pubkeys.is_empty()
                     || state.allowed_pubkeys.contains_key(&event.pubkey))
                 && (state.allowed_kinds.is_empty() || state.allowed_kinds.contains(&event.kind))
-                && event_blocked_by_address_tombstone(event, &state.deleted_addresses) == false
+                && !event_blocked_by_address_tombstone(event, &state.deleted_addresses)
                 && (filter.ids.is_some() || !event_is_superseded(event, state))
                 && !is_event_expired(event, current_unix_timestamp())
                 && event_matches_filter(event, filter)

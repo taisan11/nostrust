@@ -1,8 +1,7 @@
-use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
+use axum::extract::ws::WebSocket;
 use nojson::RawJsonValue;
-use tokio_tungstenite::tungstenite::protocol::WebSocket;
 
 use crate::{
     ConnectionAuth, DynError, EventStore, RelayConfig, RelayState, build_raw_serialized_event_data,
@@ -11,8 +10,8 @@ use crate::{
 
 use super::{extract_event_id, handle_parsed_event_submission, send_ok};
 
-pub(crate) fn handle_event(
-    ws: &mut WebSocket<TcpStream>,
+pub(crate) async fn handle_event(
+    ws: &mut WebSocket,
     relay: &Arc<Mutex<RelayState>>,
     event_store: &Arc<EventStore>,
     relay_config: &RelayConfig,
@@ -25,7 +24,8 @@ pub(crate) fn handle_event(
             "",
             false,
             "invalid: EVENT must contain exactly one event object",
-        )?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -33,14 +33,14 @@ pub(crate) fn handle_event(
     let raw_serialized = match build_raw_serialized_event_data(values[1].as_raw_str()) {
         Ok(v) => v,
         Err(err) => {
-            send_ok(ws, &event_id_hint, false, &err)?;
+            send_ok(ws, &event_id_hint, false, &err).await?;
             return Ok(());
         }
     };
     let event = match parse_event_with_options(values[1], false, Some(&raw_serialized)) {
         Ok(event) => event,
         Err(err) => {
-            send_ok(ws, &event_id_hint, false, &err)?;
+            send_ok(ws, &event_id_hint, false, &err).await?;
             return Ok(());
         }
     };
@@ -54,4 +54,5 @@ pub(crate) fn handle_event(
         event,
         &event_id_hint,
     )
+    .await
 }

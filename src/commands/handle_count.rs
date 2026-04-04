@@ -1,8 +1,7 @@
-use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
+use axum::extract::ws::WebSocket;
 use nojson::RawJsonValue;
-use tokio_tungstenite::tungstenite::protocol::WebSocket;
 
 use crate::{ConnectionAuth, DynError, RelayState};
 
@@ -11,27 +10,27 @@ use super::{
     validate_subscription_id,
 };
 
-pub(crate) fn handle_count(
-    ws: &mut WebSocket<TcpStream>,
+pub(crate) async fn handle_count(
+    ws: &mut WebSocket,
     relay: &Arc<Mutex<RelayState>>,
     auth: &ConnectionAuth,
     values: &[RawJsonValue<'_, '_>],
 ) -> Result<(), DynError> {
     if values.len() < 2 {
-        send_notice(ws, "invalid: COUNT must include a query id")?;
+        send_notice(ws, "invalid: COUNT must include a query id").await?;
         return Ok(());
     }
 
     let query_id: String = match values[1].try_into() {
         Ok(query_id) => query_id,
         Err(_) => {
-            send_notice(ws, "invalid: query id must be a string")?;
+            send_notice(ws, "invalid: query id must be a string").await?;
             return Ok(());
         }
     };
 
     if let Err(err) = validate_subscription_id(&query_id) {
-        send_closed(ws, &query_id, &err)?;
+        send_closed(ws, &query_id, &err).await?;
         return Ok(());
     }
 
@@ -40,7 +39,8 @@ pub(crate) fn handle_count(
             ws,
             &query_id,
             "invalid: COUNT must include at least one filter",
-        )?;
+        )
+        .await?;
         return Ok(());
     }
 
@@ -49,7 +49,7 @@ pub(crate) fn handle_count(
         match parse_filter(*raw_filter) {
             Ok(filter) => filters.push(filter),
             Err(err) => {
-                send_closed(ws, &query_id, &err)?;
+                send_closed(ws, &query_id, &err).await?;
                 return Ok(());
             }
         }
@@ -62,6 +62,6 @@ pub(crate) fn handle_count(
         count_matching_events_for_auth(&state, &filters, auth)
     };
 
-    send_count(ws, &query_id, count)?;
+    send_count(ws, &query_id, count).await?;
     Ok(())
 }

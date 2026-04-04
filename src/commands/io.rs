@@ -1,12 +1,9 @@
-use std::net::TcpStream;
-
-use tokio_tungstenite::tungstenite::protocol::WebSocket;
-use tokio_tungstenite::tungstenite::Message;
+use axum::extract::ws::{Message, WebSocket};
 
 use crate::{CountPayload, DynError, EventRecord};
 
-pub(crate) fn send_event(
-    ws: &mut WebSocket<TcpStream>,
+pub(crate) async fn send_event(
+    ws: &mut WebSocket,
     sub_id: &str,
     event: &EventRecord,
 ) -> Result<(), DynError> {
@@ -17,12 +14,12 @@ pub(crate) fn send_event(
     })
     .to_string();
 
-    ws.send(Message::text(frame))?;
+    ws.send(Message::Text(frame.into())).await?;
     Ok(())
 }
 
-pub(crate) fn send_ok(
-    ws: &mut WebSocket<TcpStream>,
+pub(crate) async fn send_ok(
+    ws: &mut WebSocket,
     event_id: &str,
     accepted: bool,
     message: &str,
@@ -35,23 +32,23 @@ pub(crate) fn send_ok(
     })
     .to_string();
 
-    ws.send(Message::text(frame))?;
+    ws.send(Message::Text(frame.into())).await?;
     Ok(())
 }
 
-pub(crate) fn send_eose(ws: &mut WebSocket<TcpStream>, sub_id: &str) -> Result<(), DynError> {
+pub(crate) async fn send_eose(ws: &mut WebSocket, sub_id: &str) -> Result<(), DynError> {
     let frame = nojson::array(|f| {
         f.element("EOSE")?;
         f.element(sub_id)
     })
     .to_string();
 
-    ws.send(Message::text(frame))?;
+    ws.send(Message::Text(frame.into())).await?;
     Ok(())
 }
 
-pub(crate) fn send_closed(
-    ws: &mut WebSocket<TcpStream>,
+pub(crate) async fn send_closed(
+    ws: &mut WebSocket,
     sub_id: &str,
     message: &str,
 ) -> Result<(), DynError> {
@@ -62,12 +59,12 @@ pub(crate) fn send_closed(
     })
     .to_string();
 
-    ws.send(Message::text(frame))?;
+    ws.send(Message::Text(frame.into())).await?;
     Ok(())
 }
 
-pub(crate) fn send_count(
-    ws: &mut WebSocket<TcpStream>,
+pub(crate) async fn send_count(
+    ws: &mut WebSocket,
     query_id: &str,
     count: usize,
 ) -> Result<(), DynError> {
@@ -75,27 +72,27 @@ pub(crate) fn send_count(
     let frame = nojson::array(|f| {
         f.element("COUNT")?;
         f.element(query_id)?;
-        f.element(&payload)
+        f.element(payload)
     })
     .to_string();
 
-    ws.send(Message::text(frame))?;
+    ws.send(Message::Text(frame.into())).await?;
     Ok(())
 }
 
-pub(crate) fn send_notice(ws: &mut WebSocket<TcpStream>, message: &str) -> Result<(), DynError> {
+pub(crate) async fn send_notice(ws: &mut WebSocket, message: &str) -> Result<(), DynError> {
     let frame = nojson::array(|f| {
         f.element("NOTICE")?;
         f.element(message)
     })
     .to_string();
 
-    ws.send(Message::text(frame))?;
+    ws.send(Message::Text(frame.into())).await?;
     Ok(())
 }
 
-pub(crate) fn send_auth_challenge(
-    ws: &mut WebSocket<TcpStream>,
+pub(crate) async fn send_auth_challenge(
+    ws: &mut WebSocket,
     challenge: &str,
 ) -> Result<(), DynError> {
     let frame = nojson::array(|f| {
@@ -104,6 +101,6 @@ pub(crate) fn send_auth_challenge(
     })
     .to_string();
 
-    ws.send(Message::text(frame))?;
+    ws.send(Message::Text(frame.into())).await?;
     Ok(())
 }

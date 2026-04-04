@@ -1,29 +1,42 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{Read as _, Write as _};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self as std_mpsc, Sender as StdSender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
+use axum::extract::{
+    ConnectInfo, OriginalUri, State,
+    ws::{Message, WebSocket, WebSocketUpgrade},
+};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
 use base64::Engine as _;
 use nojson::{DisplayJson, JsonFormatter, RawJson, RawJsonValue};
 use sha2::{Digest, Sha256};
-use tokio_tungstenite::tungstenite::{Error as WsError, Message, accept};
+use tokio::sync::mpsc::{self as tokio_mpsc, UnboundedSender};
 
 mod commands;
 mod crypto;
+mod errors;
 mod persistence;
 
+pub use errors::RelayError;
+
+use crate::commands::{
+    FrameContext, event_has_protected_tag, forward_live_events, handle_text_frame,
+    send_auth_challenge,
+};
 #[cfg(test)]
 use crate::commands::{
     count_matching_events, event_matches_filter, parse_filter, query_initial_events, search_score,
     subscription_is_complete, validate_auth_event, validate_subscription_id,
-};
-use crate::commands::{
-    event_has_protected_tag, forward_live_events, handle_text_frame, send_auth_challenge,
 };
 use crate::crypto::{
     compute_event_id_from_serialized, verify_delegation_signature, verify_event_signature,
@@ -99,7 +112,7 @@ struct RelayState {
     deleted_pubkeys_until: HashMap<String, i64>,
     replaceable_index: HashMap<(String, u64), String>,
     addressable_index: HashMap<(u64, String, String), String>,
-    subscribers: Vec<Sender<Arc<EventRecord>>>,
+    subscribers: Vec<UnboundedSender<Arc<EventRecord>>>,
     banned_pubkeys: BTreeMap<String, String>,
     allowed_pubkeys: BTreeMap<String, String>,
     banned_events: BTreeMap<String, String>,
@@ -197,7 +210,7 @@ impl Default for RelayState {
     }
 }
 
-static ASYNC_LOGGER: OnceLock<Sender<String>> = OnceLock::new();
+static ASYNC_LOGGER: OnceLock<StdSender<String>> = OnceLock::new();
 
 pub(crate) fn log_info(message: impl AsRef<str>) {
     log_line("info", message.as_ref());
@@ -216,7 +229,7 @@ fn init_async_logger() -> Result<(), DynError> {
         return Ok(());
     }
 
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = std_mpsc::channel::<String>();
     std::thread::Builder::new()
         .name("nostrust-logger".to_string())
         .spawn(move || {
@@ -237,7 +250,15 @@ fn log_line(level: &str, message: &str) {
     }
 }
 
-fn main() -> Result<(), DynError> {
+#[derive(Clone)]
+struct AppState {
+    relay: Arc<Mutex<RelayState>>,
+    event_store: Arc<EventStore>,
+    relay_config: RelayConfig,
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), DynError> {
     init_async_logger()?;
     let config_path = PathBuf::from("nostrust.json");
     let runtime_config = load_runtime_config(&config_path)?;
@@ -253,10 +274,10 @@ fn main() -> Result<(), DynError> {
         min_pow_difficulty: runtime_config.min_pow_difficulty,
         nip05_domain: runtime_config.nip05_domain.clone(),
     };
-    let listener = TcpListener::bind(&bind_addr)?;
     let relay = Arc::new(Mutex::new(RelayState::default()));
     let event_store = Arc::new(EventStore::open(store_path.clone())?);
     let loaded_count = load_persisted_events(&event_store, &relay, &relay_config)?;
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
     log_info(format!(
         "nostr relay listening on ws://{bind_addr} (config: {})",
@@ -283,95 +304,296 @@ fn main() -> Result<(), DynError> {
             .unwrap_or("(from Host header)")
     ));
 
-    for incoming in listener.incoming() {
-        match incoming {
-            Ok(stream) => {
-                let relay = Arc::clone(&relay);
-                let event_store = Arc::clone(&event_store);
-                let relay_config = relay_config.clone();
-                std::thread::spawn(move || {
-                    let peer = stream
-                        .peer_addr()
-                        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+    let app_state = AppState {
+        relay: Arc::clone(&relay),
+        event_store: Arc::clone(&event_store),
+        relay_config: relay_config.clone(),
+    };
+    let app = Router::new()
+        .route(
+            "/.well-known/nostr.json",
+            get(route_nip05).post(route_nip86).options(route_options),
+        )
+        .route(
+            "/",
+            get(route_root).post(route_nip86).options(route_options),
+        )
+        .route(
+            "/{*path}",
+            get(route_root).post(route_nip86).options(route_options),
+        )
+        .with_state(app_state);
 
-                    if let Err(err) =
-                        handle_connection(stream, peer, relay, event_store, relay_config)
-                    {
-                        log_error(format!("connection {peer} error: {err}"));
-                    }
-                });
-            }
-            Err(err) => log_error(format!("accept error: {err}")),
-        }
-    }
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
 
-fn handle_connection(
-    mut stream: TcpStream,
+async fn route_root(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = blocked_ip_response_if_needed(&state.relay, peer.ip()) {
+        return response;
+    }
+
+    if let Ok(upgrade) = ws {
+        return upgrade
+            .on_upgrade(move |socket| async move {
+                if let Err(err) = run_websocket_connection(socket, peer, state).await {
+                    log_error(format!("connection {peer} error: {err}"));
+                }
+            })
+            .into_response();
+    }
+
+    let request_headers = headers_to_btreemap(&headers);
+    if !request_accepts_nip11(&request_headers) {
+        return text_response(
+            StatusCode::NOT_ACCEPTABLE,
+            "NIP-11 requires Accept: application/nostr+json header\n",
+        );
+    }
+
+    match relay_info_document(&state.relay, &state.relay_config) {
+        Ok(body) => typed_response(
+            StatusCode::OK,
+            "application/nostr+json; charset=utf-8",
+            body,
+        ),
+        Err(err) => text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("error: {err}\n"),
+        ),
+    }
+}
+
+async fn route_nip05(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(response) = blocked_ip_response_if_needed(&state.relay, peer.ip()) {
+        return response;
+    }
+
+    let target = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or(uri.path());
+    let request_line = format!("GET {target} HTTP/1.1");
+    let name = match parse_query_param(&request_line, "name") {
+        Ok(value) => value.unwrap_or_else(|| "_".to_string()),
+        Err(err) => return text_response(StatusCode::BAD_REQUEST, &format!("invalid: {err}\n")),
+    };
+
+    match nip05_document(
+        &state.relay,
+        &state.relay_config,
+        &name,
+        headers.get("host").and_then(|value| value.to_str().ok()),
+    ) {
+        Ok(body) => {
+            let mut response =
+                typed_response(StatusCode::OK, "application/json; charset=utf-8", body);
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            );
+            response
+        }
+        Err(err) => text_response(StatusCode::BAD_REQUEST, &format!("invalid: {err}\n")),
+    }
+}
+
+async fn route_nip86(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = blocked_ip_response_if_needed(&state.relay, peer.ip()) {
+        return response;
+    }
+
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !content_type.contains("application/nostr+json+rpc") {
+        return text_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "NIP-86 requires Content-Type: application/nostr+json+rpc\n",
+        );
+    }
+
+    let body_text = match std::str::from_utf8(&body) {
+        Ok(text) => text.to_string(),
+        Err(_) => {
+            return text_response(
+                StatusCode::BAD_REQUEST,
+                "invalid: request body must be UTF-8 JSON\n",
+            );
+        }
+    };
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        target: uri
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| uri.path().to_string()),
+        headers: headers_to_btreemap(&headers),
+    };
+
+    match handle_nip86_http_request(&state.relay, &state.relay_config, &request, &body_text) {
+        Ok(response_body) => typed_response(
+            StatusCode::OK,
+            "application/json; charset=utf-8",
+            response_body,
+        ),
+        Err(Nip86HttpError::Unauthorized(msg)) => {
+            text_response(StatusCode::UNAUTHORIZED, &format!("{msg}\n"))
+        }
+        Err(Nip86HttpError::BadRequest(msg)) => typed_response(
+            StatusCode::BAD_REQUEST,
+            "application/json; charset=utf-8",
+            nip86_response_json(Nip86Result::Bool(false), Some(format!("invalid: {msg}"))),
+        ),
+        Err(Nip86HttpError::Internal(msg)) => typed_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json; charset=utf-8",
+            nip86_response_json(Nip86Result::Bool(false), Some(format!("error: {msg}"))),
+        ),
+    }
+}
+
+async fn route_options() -> Response {
+    typed_response(
+        StatusCode::NO_CONTENT,
+        "text/plain; charset=utf-8",
+        String::new(),
+    )
+}
+
+async fn run_websocket_connection(
+    mut ws: WebSocket,
     peer: SocketAddr,
-    relay: Arc<Mutex<RelayState>>,
-    event_store: Arc<EventStore>,
-    relay_config: RelayConfig,
+    state: AppState,
 ) -> Result<(), DynError> {
-    if maybe_serve_http_request(&mut stream, peer.ip(), &relay, &relay_config)? {
-        return Ok(());
-    }
-
-    if blocked_ip_reason(&relay, &peer.ip().to_string())?.is_some() {
-        log_warn(format!("blocked websocket connection from {peer}"));
-        return Ok(());
-    }
-
-    let mut ws = accept(stream)?;
-    ws.get_mut()
-        .set_read_timeout(Some(Duration::from_millis(200)))?;
     let challenge = format!("{}-{}", current_unix_timestamp(), std::process::id());
-    let mut auth = ConnectionAuth::new(relay_config.relay_url.clone(), challenge);
+    let mut auth = ConnectionAuth::new(state.relay_config.relay_url.clone(), challenge);
 
-    let (tx, rx) = mpsc::channel::<Arc<EventRecord>>();
+    let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Arc<EventRecord>>();
     {
-        let mut state = relay
+        let mut relay = state
+            .relay
             .lock()
             .map_err(|_| "error: relay state lock poisoned during subscriber registration")?;
-        state.subscribers.push(tx);
+        relay.subscribers.push(tx);
     }
 
     let mut subscriptions: HashMap<String, Vec<Filter>> = HashMap::new();
     let mut negentropy_sessions = crate::commands::NegentropySessions::new();
     log_info(format!("client connected: {peer}"));
-    send_auth_challenge(&mut ws, &auth.challenge)?;
+    send_auth_challenge(&mut ws, &auth.challenge).await?;
 
     loop {
-        forward_live_events(&mut ws, &rx, &subscriptions, &auth)?;
+        forward_live_events(&mut ws, &mut rx, &subscriptions, &auth).await?;
 
-        match ws.read() {
-            Ok(Message::Text(text)) => {
+        match tokio::time::timeout(Duration::from_millis(200), ws.recv()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
                 let payload = text.to_string();
-                handle_text_frame(
-                    &mut ws,
-                    &mut subscriptions,
-                    &mut negentropy_sessions,
-                    &relay,
-                    &event_store,
-                    &relay_config,
-                    &mut auth,
-                    &payload,
-                )?;
+                let mut ctx = FrameContext {
+                    ws: &mut ws,
+                    subscriptions: &mut subscriptions,
+                    negentropy_sessions: &mut negentropy_sessions,
+                    relay: &state.relay,
+                    event_store: &state.event_store,
+                    relay_config: &state.relay_config,
+                    auth: &mut auth,
+                };
+                handle_text_frame(&mut ctx, &payload).await?;
             }
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
-            Err(WsError::ConnectionClosed) => break,
-            Err(WsError::Io(err))
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(err) => return Err(err.into()),
+            Ok(Some(Ok(Message::Close(_)))) => break,
+            Ok(Some(Ok(Message::Ping(payload)))) => {
+                ws.send(Message::Pong(payload)).await?;
+            }
+            Ok(Some(Ok(Message::Binary(_)))) | Ok(Some(Ok(Message::Pong(_)))) => {}
+            Ok(Some(Err(err))) => return Err(err.into()),
+            Ok(None) => break,
+            Err(_) => {}
         }
     }
 
     log_info(format!("client disconnected: {peer}"));
     Ok(())
+}
+
+fn blocked_ip_response_if_needed(relay: &Arc<Mutex<RelayState>>, ip: IpAddr) -> Option<Response> {
+    match blocked_ip_reason(relay, &ip.to_string()) {
+        Ok(Some(_)) => Some(text_response(
+            StatusCode::FORBIDDEN,
+            "blocked: ip is blocked\n",
+        )),
+        Ok(None) => None,
+        Err(err) => Some(text_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("error: {err}\n"),
+        )),
+    }
+}
+
+fn typed_response(status: StatusCode, content_type: &'static str, body: String) -> Response {
+    let response = (
+        status,
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        body,
+    )
+        .into_response();
+    with_cors_headers(response)
+}
+
+fn text_response(status: StatusCode, body: &str) -> Response {
+    typed_response(status, "text/plain; charset=utf-8", body.to_string())
+}
+
+fn with_cors_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
+    headers.insert(
+        "Access-Control-Allow-Headers",
+        HeaderValue::from_static("Authorization, Content-Type, Accept"),
+    );
+    headers.insert(
+        "Access-Control-Allow-Methods",
+        HeaderValue::from_static("GET, OPTIONS, POST"),
+    );
+    response
+}
+
+fn headers_to_btreemap(headers: &HeaderMap) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for name in headers.keys() {
+        let values = headers
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            continue;
+        }
+        out.insert(name.as_str().to_ascii_lowercase(), values.join(", "));
+    }
+    out
 }
 
 fn load_runtime_config(path: &Path) -> Result<RuntimeConfig, DynError> {
@@ -460,222 +682,6 @@ fn parse_runtime_config_json(text: &str) -> Result<RuntimeConfig, String> {
     Ok(config)
 }
 
-fn maybe_serve_http_request(
-    stream: &mut TcpStream,
-    peer_ip: IpAddr,
-    relay: &Arc<Mutex<RelayState>>,
-    relay_config: &RelayConfig,
-) -> Result<bool, DynError> {
-    let mut peek_buf = [0u8; 4096];
-    let read_len = stream.peek(&mut peek_buf)?;
-    if read_len == 0 {
-        return Ok(false);
-    }
-
-    let request = String::from_utf8_lossy(&peek_buf[..read_len]);
-    let request_lower = request.to_ascii_lowercase();
-    if !request.starts_with("GET ")
-        && !request.starts_with("OPTIONS ")
-        && !request.starts_with("POST ")
-    {
-        return Ok(false);
-    }
-
-    let is_websocket_upgrade = request_lower.contains("upgrade: websocket")
-        || request_lower.contains("connection: upgrade");
-    if is_websocket_upgrade {
-        return Ok(false);
-    }
-
-    let request_bytes = read_http_request_bytes(stream)?;
-    let parsed = match parse_http_request(&request_bytes) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            let body = format!("invalid: {err}\n");
-            send_http_response(
-                stream,
-                400,
-                "Bad Request",
-                "text/plain; charset=utf-8",
-                &body,
-                &[],
-            )?;
-            return Ok(true);
-        }
-    };
-
-    if blocked_ip_reason(relay, &peer_ip.to_string())?.is_some() {
-        send_http_response(
-            stream,
-            403,
-            "Forbidden",
-            "text/plain; charset=utf-8",
-            "blocked: ip is blocked\n",
-            &[],
-        )?;
-        return Ok(true);
-    }
-
-    if parsed.method == "OPTIONS" {
-        send_http_response(
-            stream,
-            204,
-            "No Content",
-            "text/plain; charset=utf-8",
-            "",
-            &[("Access-Control-Allow-Methods", "GET, OPTIONS, POST")],
-        )?;
-        return Ok(true);
-    }
-
-    if parsed.method == "POST" {
-        let content_type = parsed
-            .headers
-            .get("content-type")
-            .map(|v| v.to_ascii_lowercase())
-            .unwrap_or_default();
-        if !content_type.contains("application/nostr+json+rpc") {
-            send_http_response(
-                stream,
-                415,
-                "Unsupported Media Type",
-                "text/plain; charset=utf-8",
-                "NIP-86 requires Content-Type: application/nostr+json+rpc\n",
-                &[],
-            )?;
-            return Ok(true);
-        }
-
-        let body = String::from_utf8(parsed.body.clone())
-            .map_err(|_| "invalid: request body must be UTF-8 JSON".to_string())?;
-        match handle_nip86_http_request(relay, relay_config, &parsed, &body) {
-            Ok(response_body) => {
-                send_http_response(
-                    stream,
-                    200,
-                    "OK",
-                    "application/json; charset=utf-8",
-                    &response_body,
-                    &[],
-                )?;
-                return Ok(true);
-            }
-            Err(Nip86HttpError::Unauthorized(msg)) => {
-                send_http_response(
-                    stream,
-                    401,
-                    "Unauthorized",
-                    "text/plain; charset=utf-8",
-                    &format!("{msg}\n"),
-                    &[],
-                )?;
-                return Ok(true);
-            }
-            Err(Nip86HttpError::BadRequest(msg)) => {
-                let body =
-                    nip86_response_json(Nip86Result::Bool(false), Some(format!("invalid: {msg}")));
-                send_http_response(
-                    stream,
-                    400,
-                    "Bad Request",
-                    "application/json; charset=utf-8",
-                    &body,
-                    &[],
-                )?;
-                return Ok(true);
-            }
-            Err(Nip86HttpError::Internal(msg)) => {
-                let body =
-                    nip86_response_json(Nip86Result::Bool(false), Some(format!("error: {msg}")));
-                send_http_response(
-                    stream,
-                    500,
-                    "Internal Server Error",
-                    "application/json; charset=utf-8",
-                    &body,
-                    &[],
-                )?;
-                return Ok(true);
-            }
-        }
-    }
-
-    if parsed.method != "GET" {
-        return Ok(false);
-    }
-
-    if parsed.target.starts_with("/.well-known/nostr.json") {
-        let request_line = format!("GET {} HTTP/1.1", parsed.target);
-        let name = match parse_query_param(&request_line, "name") {
-            Ok(value) => value.unwrap_or_else(|| "_".to_string()),
-            Err(err) => {
-                send_http_response(
-                    stream,
-                    400,
-                    "Bad Request",
-                    "text/plain; charset=utf-8",
-                    &format!("invalid: {err}\n"),
-                    &[],
-                )?;
-                return Ok(true);
-            }
-        };
-        match nip05_document(
-            relay,
-            relay_config,
-            &name,
-            parsed.headers.get("host").map(String::as_str),
-        ) {
-            Ok(body) => {
-                send_http_response(
-                    stream,
-                    200,
-                    "OK",
-                    "application/json; charset=utf-8",
-                    &body,
-                    &[("Cache-Control", "no-store")],
-                )?;
-                return Ok(true);
-            }
-            Err(err) => {
-                send_http_response(
-                    stream,
-                    400,
-                    "Bad Request",
-                    "text/plain; charset=utf-8",
-                    &format!("invalid: {err}\n"),
-                    &[],
-                )?;
-                return Ok(true);
-            }
-        }
-    }
-
-    if !request_accepts_nip11(&parsed.headers) {
-        send_http_response(
-            stream,
-            406,
-            "Not Acceptable",
-            "text/plain; charset=utf-8",
-            "NIP-11 requires Accept: application/nostr+json header\n",
-            &[],
-        )?;
-        return Ok(true);
-    }
-
-    let body = relay_info_document(relay, relay_config)?;
-    send_http_response(
-        stream,
-        200,
-        "OK",
-        "application/nostr+json; charset=utf-8",
-        &body,
-        &[],
-    )?;
-
-    Ok(true)
-}
-
 fn request_accepts_nip11(headers: &BTreeMap<String, String>) -> bool {
     headers
         .get("accept")
@@ -688,168 +694,6 @@ struct HttpRequest {
     method: String,
     target: String,
     headers: BTreeMap<String, String>,
-    body: Vec<u8>,
-}
-
-fn read_http_request_bytes(stream: &mut TcpStream) -> Result<Vec<u8>, DynError> {
-    stream.set_read_timeout(Some(Duration::from_millis(1000)))?;
-    let mut data = Vec::new();
-    let mut buf = [0u8; 8192];
-    let mut header_end = None;
-    let mut content_length = 0usize;
-
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                data.extend_from_slice(&buf[..n]);
-                if header_end.is_none()
-                    && let Some(pos) = find_subslice(&data, b"\r\n\r\n")
-                {
-                    header_end = Some(pos + 4);
-                    let headers_text = String::from_utf8_lossy(&data[..pos + 4]);
-                    content_length = parse_content_length_from_headers(&headers_text)?;
-                }
-                if let Some(end) = header_end
-                    && data.len() >= end + content_length
-                {
-                    break;
-                }
-            }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                if header_end.is_none() {
-                    return Err("invalid: timed out reading HTTP request headers".into());
-                }
-                if let Some(end) = header_end
-                    && data.len() >= end + content_length
-                {
-                    break;
-                }
-                return Err("invalid: timed out reading HTTP request body".into());
-            }
-            Err(err) => return Err(err.into()),
-        }
-    }
-
-    stream.set_read_timeout(None)?;
-
-    if find_subslice(&data, b"\r\n\r\n").is_none() {
-        return Err("invalid: malformed HTTP request".into());
-    }
-
-    Ok(data)
-}
-
-fn parse_content_length_from_headers(headers_text: &str) -> Result<usize, DynError> {
-    for line in headers_text.lines().skip(1) {
-        if let Some((name, value)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-        {
-            let len = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| "invalid: Content-Length must be a decimal number")?;
-            return Ok(len);
-        }
-    }
-    Ok(0)
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn parse_http_request(data: &[u8]) -> Result<HttpRequest, String> {
-    let Some(header_end) = find_subslice(data, b"\r\n\r\n") else {
-        return Err("malformed HTTP request".to_string());
-    };
-    let header_bytes = &data[..header_end];
-    let body = data[header_end + 4..].to_vec();
-    let header_text =
-        std::str::from_utf8(header_bytes).map_err(|_| "HTTP headers must be UTF-8".to_string())?;
-
-    let mut lines = header_text.lines();
-    let request_line = lines
-        .next()
-        .ok_or_else(|| "missing HTTP request line".to_string())?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| "missing HTTP method".to_string())?
-        .to_string();
-    let target = parts
-        .next()
-        .ok_or_else(|| "missing HTTP target".to_string())?
-        .to_string();
-    let _version = parts
-        .next()
-        .ok_or_else(|| "missing HTTP version".to_string())?;
-
-    let mut headers = BTreeMap::new();
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            return Err("malformed HTTP header line".to_string());
-        };
-        let key = name.trim().to_ascii_lowercase();
-        let val = value.trim().to_string();
-        headers
-            .entry(key)
-            .and_modify(|existing: &mut String| {
-                if !existing.is_empty() {
-                    existing.push_str(", ");
-                }
-                existing.push_str(&val);
-            })
-            .or_insert(val);
-    }
-
-    Ok(HttpRequest {
-        method,
-        target,
-        headers,
-        body,
-    })
-}
-
-fn send_http_response(
-    stream: &mut TcpStream,
-    status: u16,
-    reason: &str,
-    content_type: &str,
-    body: &str,
-    extra_headers: &[(&str, &str)],
-) -> Result<(), DynError> {
-    let mut headers = String::new();
-    headers.push_str(&format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: {content_type}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Headers: Authorization, Content-Type, Accept\r\n\
-         Access-Control-Allow-Methods: GET, OPTIONS, POST\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n",
-        body.len()
-    ));
-    for (name, value) in extra_headers {
-        headers.push_str(name);
-        headers.push_str(": ");
-        headers.push_str(value);
-        headers.push_str("\r\n");
-    }
-    headers.push_str("\r\n");
-    headers.push_str(body);
-
-    stream.write_all(headers.as_bytes())?;
-    stream.flush()?;
-    Ok(())
 }
 
 fn blocked_ip_reason(relay: &Arc<Mutex<RelayState>>, ip: &str) -> Result<Option<String>, String> {
@@ -1502,11 +1346,11 @@ fn query_hex_nibble(ch: u8) -> Result<u8, String> {
     }
 }
 
-fn nip05_document<'a>(
+fn nip05_document(
     relay: &Arc<Mutex<RelayState>>,
     relay_config: &RelayConfig,
     requested_name: &str,
-    host_header: Option<&'a str>,
+    host_header: Option<&str>,
 ) -> Result<String, String> {
     validate_nip05_name(requested_name)?;
     let domain = if let Some(domain) = relay_config.nip05_domain.as_ref() {
@@ -1978,19 +1822,19 @@ fn publish_event(
         KindClass::Replaceable => {
             let key = (event_arc.pubkey.clone(), event_arc.kind);
             if let Some(existing_id) = state.replaceable_index.get(&key).cloned() {
-                if let Some(existing_event) = state.events_by_id.get(&existing_id) {
-                    if !is_better_replace_candidate(&event_arc, existing_event) {
-                        if event_arc.kind == 3 {
-                            state
-                                .archived_events_by_id
-                                .insert(event_arc.id.clone(), Arc::clone(&event_arc));
-                            return Ok(PublishOutcome::Accepted {
-                                event: event_arc,
-                                message: String::new(),
-                            });
-                        }
-                        return Err("blocked: have newer replaceable event".to_string());
+                if let Some(existing_event) = state.events_by_id.get(&existing_id)
+                    && !is_better_replace_candidate(&event_arc, existing_event)
+                {
+                    if event_arc.kind == 3 {
+                        state
+                            .archived_events_by_id
+                            .insert(event_arc.id.clone(), Arc::clone(&event_arc));
+                        return Ok(PublishOutcome::Accepted {
+                            event: event_arc,
+                            message: String::new(),
+                        });
                     }
+                    return Err("blocked: have newer replaceable event".to_string());
                 }
                 if should_broadcast {
                     remove_active_event_by_id(&mut state, &existing_id);
@@ -2012,10 +1856,10 @@ fn publish_event(
             );
 
             if let Some(existing_id) = state.addressable_index.get(&key).cloned() {
-                if let Some(existing_event) = state.events_by_id.get(&existing_id) {
-                    if !is_better_replace_candidate(&event_arc, existing_event) {
-                        return Err("blocked: have newer addressable event".to_string());
-                    }
+                if let Some(existing_event) = state.events_by_id.get(&existing_id)
+                    && !is_better_replace_candidate(&event_arc, existing_event)
+                {
+                    return Err("blocked: have newer addressable event".to_string());
                 }
                 if should_broadcast {
                     remove_active_event_by_id(&mut state, &existing_id);
@@ -2319,7 +2163,9 @@ fn build_raw_serialized_event_data(event_json: &str) -> Result<String, String> {
 }
 
 fn parse_raw_event_field(event: RawJsonValue<'_, '_>, field: &str) -> Result<String, String> {
-    let member = event.to_member(field).map_err(|e| format!("invalid: {e}"))?;
+    let member = event
+        .to_member(field)
+        .map_err(|e| format!("invalid: {e}"))?;
     let value = member
         .required()
         .map_err(|_| format!("invalid: missing field {field} in raw event"))?;
@@ -2799,28 +2645,28 @@ fn apply_deletion_request(
         .map_err(|_| "relay state lock poisoned during deletion".to_string())?;
 
     for tag in &deletion.tags {
-        if tag.first().map(String::as_str) == Some("e") {
-            if let Some(target_id) = tag.get(1) {
-                let target = state
-                    .events_by_id
-                    .get(target_id)
-                    .or_else(|| state.archived_events_by_id.get(target_id))
-                    .cloned();
-                let Some(target) = target else {
-                    continue;
-                };
-                if target.kind == 5 {
-                    continue;
-                }
-                if target.pubkey != deletion.pubkey
-                    && event_delegator_pubkey(&target) != Some(deletion.pubkey.as_str())
-                {
-                    continue;
-                }
-
-                state.deleted_event_ids.insert(target_id.clone());
-                remove_active_event_by_id(&mut state, target_id);
+        if tag.first().map(String::as_str) == Some("e")
+            && let Some(target_id) = tag.get(1)
+        {
+            let target = state
+                .events_by_id
+                .get(target_id)
+                .or_else(|| state.archived_events_by_id.get(target_id))
+                .cloned();
+            let Some(target) = target else {
+                continue;
+            };
+            if target.kind == 5 {
+                continue;
             }
+            if target.pubkey != deletion.pubkey
+                && event_delegator_pubkey(&target) != Some(deletion.pubkey.as_str())
+            {
+                continue;
+            }
+
+            state.deleted_event_ids.insert(target_id.clone());
+            remove_active_event_by_id(&mut state, target_id);
         }
 
         if tag.first().map(String::as_str) == Some("a")

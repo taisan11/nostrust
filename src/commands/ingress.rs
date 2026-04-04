@@ -1,16 +1,16 @@
 use std::collections::HashMap;
-use std::net::TcpStream;
-use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
-use nojson::{RawJson, RawJsonValue};
+use axum::extract::ws::{Message, WebSocket};
 use negentropy::{Id, Negentropy, NegentropyStorageVector};
-use tokio_tungstenite::tungstenite::protocol::WebSocket;
+use nojson::{RawJson, RawJsonValue};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::crypto::compute_event_id_from_serialized;
 use crate::{
     ConnectionAuth, DynError, EventRecord, EventStore, Filter, RelayConfig, RelayState,
-    build_raw_serialized_event_data, escape_control_chars_in_json_strings, parse_event_with_options,
+    build_raw_serialized_event_data, escape_control_chars_in_json_strings,
+    parse_event_with_options,
 };
 
 use super::{
@@ -26,45 +26,54 @@ pub(crate) struct NegentropySession {
 
 pub(crate) type NegentropySessions = HashMap<String, NegentropySession>;
 
-pub(crate) fn forward_live_events(
-    ws: &mut WebSocket<TcpStream>,
-    rx: &Receiver<Arc<EventRecord>>,
+/// Context for handling incoming WebSocket frames
+pub(crate) struct FrameContext<'a> {
+    pub ws: &'a mut WebSocket,
+    pub subscriptions: &'a mut HashMap<String, Vec<Filter>>,
+    pub negentropy_sessions: &'a mut NegentropySessions,
+    pub relay: &'a Arc<Mutex<RelayState>>,
+    pub event_store: &'a Arc<EventStore>,
+    pub relay_config: &'a RelayConfig,
+    pub auth: &'a mut ConnectionAuth,
+}
+
+pub(crate) async fn forward_live_events(
+    ws: &mut WebSocket,
+    rx: &mut UnboundedReceiver<Arc<EventRecord>>,
     subscriptions: &HashMap<String, Vec<Filter>>,
     auth: &ConnectionAuth,
 ) -> Result<(), DynError> {
-    loop {
-        match rx.try_recv() {
-            Ok(event) => {
-                for (sub_id, filters) in subscriptions {
-                    if super::matches_any_filter_for_auth(&event, filters, auth) {
-                        send_event(ws, sub_id, &event)?;
-                    }
-                }
+    while let Ok(event) = rx.try_recv() {
+        for (sub_id, filters) in subscriptions {
+            if super::matches_any_filter_for_auth(&event, filters, auth) {
+                send_event(ws, sub_id, &event).await?;
             }
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
         }
     }
 
     Ok(())
 }
 
-pub(crate) fn handle_text_frame(
-    ws: &mut WebSocket<TcpStream>,
-    subscriptions: &mut HashMap<String, Vec<Filter>>,
-    negentropy_sessions: &mut NegentropySessions,
-    relay: &Arc<Mutex<RelayState>>,
-    event_store: &Arc<EventStore>,
-    relay_config: &RelayConfig,
-    auth: &mut ConnectionAuth,
+pub(crate) async fn handle_text_frame(
+    ctx: &mut FrameContext<'_>,
     text: &str,
 ) -> Result<(), DynError> {
     let raw = match RawJson::parse(text) {
         Ok(value) => value,
         Err(err) => {
-            if try_handle_relaxed_event_frame(ws, relay, event_store, relay_config, auth, text)? {
+            if try_handle_relaxed_event_frame(
+                ctx.ws,
+                ctx.relay,
+                ctx.event_store,
+                ctx.relay_config,
+                ctx.auth,
+                text,
+            )
+            .await?
+            {
                 return Ok(());
             }
-            send_notice(ws, &format!("invalid: {err}"))?;
+            send_notice(ctx.ws, &format!("invalid: {err}")).await?;
             return Ok(());
         }
     };
@@ -73,42 +82,61 @@ pub(crate) fn handle_text_frame(
     let values: Vec<RawJsonValue<'_, '_>> = match root.try_into() {
         Ok(values) => values,
         Err(_) => {
-            send_notice(ws, "invalid: message must be a JSON array")?;
+            send_notice(ctx.ws, "invalid: message must be a JSON array").await?;
             return Ok(());
         }
     };
 
     if values.is_empty() {
-        send_notice(ws, "invalid: message must be a non-empty array")?;
+        send_notice(ctx.ws, "invalid: message must be a non-empty array").await?;
         return Ok(());
     }
 
     let command: String = match values[0].try_into() {
         Ok(command) => command,
         Err(_) => {
-            send_notice(ws, "invalid: first element must be a command string")?;
+            send_notice(ctx.ws, "invalid: first element must be a command string").await?;
             return Ok(());
         }
     };
 
     match command.as_str() {
-        "REQ" => handle_req(ws, subscriptions, relay, auth, &values),
-        "COUNT" => handle_count(ws, relay, auth, &values),
-        "CLOSE" => super::handle_close(subscriptions, &values),
-        "NEG-OPEN" => handle_neg_open(ws, negentropy_sessions, relay, auth, &values),
-        "NEG-MSG" => handle_neg_msg(ws, negentropy_sessions, &values),
-        "NEG-CLOSE" => handle_neg_close(negentropy_sessions, &values),
-        "EVENT" => handle_event(ws, relay, event_store, relay_config, auth, &values),
-        "AUTH" => handle_auth(ws, auth, &values),
+        "REQ" => handle_req(ctx.ws, ctx.subscriptions, ctx.relay, ctx.auth, &values).await,
+        "COUNT" => handle_count(ctx.ws, ctx.relay, ctx.auth, &values).await,
+        "CLOSE" => super::handle_close(ctx.subscriptions, &values),
+        "NEG-OPEN" => {
+            handle_neg_open(
+                ctx.ws,
+                ctx.negentropy_sessions,
+                ctx.relay,
+                ctx.auth,
+                &values,
+            )
+            .await
+        }
+        "NEG-MSG" => handle_neg_msg(ctx.ws, ctx.negentropy_sessions, &values).await,
+        "NEG-CLOSE" => handle_neg_close(ctx.negentropy_sessions, &values),
+        "EVENT" => {
+            handle_event(
+                ctx.ws,
+                ctx.relay,
+                ctx.event_store,
+                ctx.relay_config,
+                ctx.auth,
+                &values,
+            )
+            .await
+        }
+        "AUTH" => handle_auth(ctx.ws, ctx.auth, &values).await,
         _ => {
-            send_notice(ws, &format!("unsupported: command {command}"))?;
+            send_notice(ctx.ws, &format!("unsupported: command {command}")).await?;
             Ok(())
         }
     }
 }
 
-fn try_handle_relaxed_event_frame(
-    ws: &mut WebSocket<TcpStream>,
+async fn try_handle_relaxed_event_frame(
+    ws: &mut WebSocket,
     relay: &Arc<Mutex<RelayState>>,
     event_store: &Arc<EventStore>,
     relay_config: &RelayConfig,
@@ -150,7 +178,7 @@ fn try_handle_relaxed_event_frame(
     let event = match parse_event_with_options(raw.value(), false, Some(&raw_serialized)) {
         Ok(event) => event,
         Err(err) => {
-            send_ok(ws, &event_id_hint, false, &err)?;
+            send_ok(ws, &event_id_hint, false, &err).await?;
             return Ok(true);
         }
     };
@@ -161,7 +189,8 @@ fn try_handle_relaxed_event_frame(
             &event_id_hint,
             false,
             "invalid: event id does not match serialized event hash",
-        )?;
+        )
+        .await?;
         return Ok(true);
     }
 
@@ -173,13 +202,14 @@ fn try_handle_relaxed_event_frame(
         auth,
         event,
         &event_id_hint,
-    )?;
+    )
+    .await?;
 
     Ok(true)
 }
 
-fn handle_neg_open(
-    ws: &mut WebSocket<TcpStream>,
+async fn handle_neg_open(
+    ws: &mut WebSocket,
     sessions: &mut NegentropySessions,
     relay: &Arc<Mutex<RelayState>>,
     auth: &ConnectionAuth,
@@ -190,26 +220,27 @@ fn handle_neg_open(
             ws,
             "",
             "invalid: NEG-OPEN must include subscription id, filter and initial message",
-        )?;
+        )
+        .await?;
         return Ok(());
     }
 
     let sub_id: String = match values[1].try_into() {
         Ok(sub_id) => sub_id,
         Err(_) => {
-            send_neg_err(ws, "", "invalid: NEG-OPEN subscription id must be a string")?;
+            send_neg_err(ws, "", "invalid: NEG-OPEN subscription id must be a string").await?;
             return Ok(());
         }
     };
     if let Err(err) = validate_subscription_id(&sub_id) {
-        send_neg_err(ws, &sub_id, &err)?;
+        send_neg_err(ws, &sub_id, &err).await?;
         return Ok(());
     }
 
     let filter = match parse_filter(values[2]) {
         Ok(filter) => filter,
         Err(err) => {
-            send_neg_err(ws, &sub_id, &err)?;
+            send_neg_err(ws, &sub_id, &err).await?;
             return Ok(());
         }
     };
@@ -220,14 +251,15 @@ fn handle_neg_open(
                 ws,
                 &sub_id,
                 "invalid: NEG-OPEN initial message must be hex string",
-            )?;
+            )
+            .await?;
             return Ok(());
         }
     };
     let message = match hex_to_bytes(&message_hex) {
         Ok(bytes) => bytes,
         Err(err) => {
-            send_neg_err(ws, &sub_id, &err)?;
+            send_neg_err(ws, &sub_id, &err).await?;
             return Ok(());
         }
     };
@@ -242,7 +274,7 @@ fn handle_neg_open(
     let mut engine = match Negentropy::owned(storage.clone(), 0) {
         Ok(engine) => engine,
         Err(err) => {
-            send_neg_err(ws, &sub_id, &format!("error: NEG-OPEN init failed ({err})"))?;
+            send_neg_err(ws, &sub_id, &format!("error: NEG-OPEN init failed ({err})")).await?;
             return Ok(());
         }
     };
@@ -253,18 +285,19 @@ fn handle_neg_open(
                 ws,
                 &sub_id,
                 &format!("invalid: NEG-OPEN reconciliation failed ({err})"),
-            )?;
+            )
+            .await?;
             return Ok(());
         }
     };
 
     sessions.insert(sub_id.clone(), NegentropySession { storage });
-    send_neg_msg(ws, &sub_id, &bytes_to_hex(&response))?;
+    send_neg_msg(ws, &sub_id, &bytes_to_hex(&response)).await?;
     Ok(())
 }
 
-fn handle_neg_msg(
-    ws: &mut WebSocket<TcpStream>,
+async fn handle_neg_msg(
+    ws: &mut WebSocket,
     sessions: &mut NegentropySessions,
     values: &[RawJsonValue<'_, '_>],
 ) -> Result<(), DynError> {
@@ -273,33 +306,34 @@ fn handle_neg_msg(
             ws,
             "",
             "invalid: NEG-MSG must include subscription id and message",
-        )?;
+        )
+        .await?;
         return Ok(());
     }
 
     let sub_id: String = match values[1].try_into() {
         Ok(sub_id) => sub_id,
         Err(_) => {
-            send_neg_err(ws, "", "invalid: NEG-MSG subscription id must be a string")?;
+            send_neg_err(ws, "", "invalid: NEG-MSG subscription id must be a string").await?;
             return Ok(());
         }
     };
     let Some(session) = sessions.get(&sub_id) else {
-        send_neg_err(ws, &sub_id, "closed: unknown NEG subscription id")?;
+        send_neg_err(ws, &sub_id, "closed: unknown NEG subscription id").await?;
         return Ok(());
     };
 
     let message_hex: String = match values[2].try_into() {
         Ok(value) => value,
         Err(_) => {
-            send_neg_err(ws, &sub_id, "invalid: NEG-MSG payload must be hex string")?;
+            send_neg_err(ws, &sub_id, "invalid: NEG-MSG payload must be hex string").await?;
             return Ok(());
         }
     };
     let message = match hex_to_bytes(&message_hex) {
         Ok(bytes) => bytes,
         Err(err) => {
-            send_neg_err(ws, &sub_id, &err)?;
+            send_neg_err(ws, &sub_id, &err).await?;
             return Ok(());
         }
     };
@@ -307,7 +341,7 @@ fn handle_neg_msg(
     let mut engine = match Negentropy::owned(session.storage.clone(), 0) {
         Ok(engine) => engine,
         Err(err) => {
-            send_neg_err(ws, &sub_id, &format!("error: NEG-MSG init failed ({err})"))?;
+            send_neg_err(ws, &sub_id, &format!("error: NEG-MSG init failed ({err})")).await?;
             return Ok(());
         }
     };
@@ -319,12 +353,13 @@ fn handle_neg_msg(
                 ws,
                 &sub_id,
                 &format!("invalid: NEG-MSG reconciliation failed ({err})"),
-            )?;
+            )
+            .await?;
             return Ok(());
         }
     };
 
-    send_neg_msg(ws, &sub_id, &bytes_to_hex(&response))?;
+    send_neg_msg(ws, &sub_id, &bytes_to_hex(&response)).await?;
     Ok(())
 }
 
@@ -363,7 +398,7 @@ fn build_negentropy_storage(
 }
 
 fn hex_to_bytes(value: &str) -> Result<Vec<u8>, String> {
-    if value.is_empty() || value.len() % 2 != 0 {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
         return Err("invalid: NEG payload must be non-empty even-length hex".to_string());
     }
     if !value
@@ -409,32 +444,24 @@ fn hex_digit(nibble: u8) -> char {
     HEX[nibble as usize] as char
 }
 
-fn send_neg_msg(
-    ws: &mut WebSocket<TcpStream>,
-    sub_id: &str,
-    payload_hex: &str,
-) -> Result<(), DynError> {
+async fn send_neg_msg(ws: &mut WebSocket, sub_id: &str, payload_hex: &str) -> Result<(), DynError> {
     let frame = nojson::array(|f| {
         f.element("NEG-MSG")?;
         f.element(sub_id)?;
         f.element(payload_hex)
     })
     .to_string();
-    ws.send(tokio_tungstenite::tungstenite::Message::text(frame))?;
+    ws.send(Message::Text(frame.into())).await?;
     Ok(())
 }
 
-fn send_neg_err(
-    ws: &mut WebSocket<TcpStream>,
-    sub_id: &str,
-    reason: &str,
-) -> Result<(), DynError> {
+async fn send_neg_err(ws: &mut WebSocket, sub_id: &str, reason: &str) -> Result<(), DynError> {
     let frame = nojson::array(|f| {
         f.element("NEG-ERR")?;
         f.element(sub_id)?;
         f.element(reason)
     })
     .to_string();
-    ws.send(tokio_tungstenite::tungstenite::Message::text(frame))?;
+    ws.send(Message::Text(frame.into())).await?;
     Ok(())
 }

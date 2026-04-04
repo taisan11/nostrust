@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 use turso::{Builder, Connection};
 
-use crate::{DynError, EventRecord};
+use crate::{DynError, EventRecord, RelayError};
 
 #[derive(Debug)]
 pub struct EventStore {
@@ -44,7 +44,7 @@ impl EventStore {
         })
     }
 
-    pub fn append_event(&self, event: &EventRecord) -> Result<(), String> {
+    pub fn append_event(&self, event: &EventRecord) -> Result<(), RelayError> {
         let id = event.id.clone();
         let payload = nojson::Json(event).to_string();
         let conn = Arc::clone(&self.conn);
@@ -57,7 +57,12 @@ impl EventStore {
                 .await
             })
             .map(|_| ())
-            .map_err(|e| format!("failed to persist event in {}: {e}", self.path.display()))
+            .map_err(|e| {
+                RelayError::internal(format!(
+                    "failed to persist event in {}: {e}",
+                    self.path.display()
+                ))
+            })
     }
 
     pub fn load_event_payloads(&self) -> Result<Vec<String>, DynError> {

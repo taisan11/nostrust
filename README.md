@@ -47,4 +47,7 @@ Notes:
 
 - **NIP-57 (Lightning Zaps):** kind `9734` and `9735` validation rules are enforced.
 - **NIP-86 (Relay Management API):** HTTP JSON-RPC endpoint over the relay URI with NIP-98 authorization (`Authorization: Nostr ...`) and moderation/state management methods.
-- **NIP-B7 (Blossom media):** kind `10063` user server-list validation is enforced (`server` tags with `http(s)` URLs).
+- **NIP-B7 (Blossom media):**
+  - kind `10063` user server-list validation (`server` tags with `http(s)` URLs)
+  - Blossom endpoints: `GET|HEAD /<sha256>[.ext]`, `PUT|HEAD /upload`, `PUT|HEAD /media`, `GET /list/<pubkey>`, `DELETE /<sha256>`, `PUT /report`
+  - BUD-11 style Nostr authorization token validation (kind `24242`) for scoped blob operations

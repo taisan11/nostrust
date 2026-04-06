@@ -144,41 +144,33 @@ pub(crate) fn extract_event_id(value: RawJsonValue<'_, '_>) -> String {
         .unwrap_or_default()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn query_initial_events(
     state: &RelayState,
     filters: &[Filter],
 ) -> Vec<Arc<EventRecord>> {
+    query_initial_events_inner(state, filters, None)
+}
+
+fn query_initial_events_inner(
+    state: &RelayState,
+    filters: &[Filter],
+    auth: Option<&ConnectionAuth>,
+) -> Vec<Arc<EventRecord>> {
+    let now = current_unix_timestamp();
+    let parsed_search_terms = parsed_search_terms_for_filters(filters);
     let mut selected: HashMap<String, Arc<EventRecord>> = HashMap::new();
 
-    for filter in filters {
-        let mut matching = if let Some(ids) = &filter.ids {
-            ids.iter()
-                .filter_map(|id| {
-                    state
-                        .events_by_id
-                        .get(id)
-                        .or_else(|| state.archived_events_by_id.get(id))
-                        .cloned()
-                })
-                .collect::<Vec<_>>()
-        } else {
-            state.events_by_id.values().cloned().collect::<Vec<_>>()
-        };
-
-        matching.retain(|event| {
-            !state.deleted_event_ids.contains(&event.id)
-                && !state.banned_events.contains_key(&event.id)
-                && !state.banned_pubkeys.contains_key(&event.pubkey)
-                && (state.allowed_pubkeys.is_empty()
-                    || state.allowed_pubkeys.contains_key(&event.pubkey))
-                && (state.allowed_kinds.is_empty() || state.allowed_kinds.contains(&event.kind))
-                && !event_blocked_by_address_tombstone(event, &state.deleted_addresses)
-                && (filter.ids.is_some() || !event_is_superseded(event, state))
-                && !is_event_expired(event, current_unix_timestamp())
-                && event_matches_filter(event, filter)
+    for (filter, search_terms) in filters.iter().zip(parsed_search_terms.iter()) {
+        let mut matching = Vec::new();
+        for_each_filter_candidate(state, filter, |event| {
+            if event_matches_initial_query(event, state, filter, search_terms.as_deref(), auth, now)
+            {
+                matching.push(Arc::clone(event));
+            }
         });
 
-        matching.sort_by(|a, b| compare_events_for_filter(filter, a, b));
+        matching.sort_by(|a, b| compare_events_for_filter(search_terms.as_deref(), a, b));
 
         if let Some(limit) = filter.limit {
             matching.truncate(limit);
@@ -190,8 +182,8 @@ pub(crate) fn query_initial_events(
     }
 
     let mut out = selected.into_values().collect::<Vec<_>>();
-    if filters.iter().any(|filter| filter.search.is_some()) {
-        out.sort_by(|a, b| compare_events_for_filters(filters, a, b));
+    if parsed_search_terms.iter().any(Option::is_some) {
+        out.sort_by(|a, b| compare_events_for_filters(&parsed_search_terms, a, b));
     } else {
         out.sort_by(compare_events_desc);
     }
@@ -203,10 +195,7 @@ pub(crate) fn query_initial_events_for_auth(
     filters: &[Filter],
     auth: &ConnectionAuth,
 ) -> Vec<Arc<EventRecord>> {
-    query_initial_events(state, filters)
-        .into_iter()
-        .filter(|event| event_visible_to_auth(event, auth))
-        .collect()
+    query_initial_events_inner(state, filters, Some(auth))
 }
 
 fn compare_events_desc(a: &Arc<EventRecord>, b: &Arc<EventRecord>) -> Ordering {
@@ -216,13 +205,13 @@ fn compare_events_desc(a: &Arc<EventRecord>, b: &Arc<EventRecord>) -> Ordering {
 }
 
 fn compare_events_for_filter(
-    filter: &Filter,
+    search_terms: Option<&[String]>,
     a: &Arc<EventRecord>,
     b: &Arc<EventRecord>,
 ) -> Ordering {
-    if let Some(search) = &filter.search {
-        let a_score = search_score(a, search).unwrap_or(0);
-        let b_score = search_score(b, search).unwrap_or(0);
+    if let Some(search_terms) = search_terms {
+        let a_score = search_score_for_terms(a, search_terms).unwrap_or(0);
+        let b_score = search_score_for_terms(b, search_terms).unwrap_or(0);
         b_score
             .cmp(&a_score)
             .then_with(|| compare_events_desc(a, b))
@@ -232,59 +221,53 @@ fn compare_events_for_filter(
 }
 
 fn compare_events_for_filters(
-    filters: &[Filter],
+    parsed_search_terms: &[Option<Vec<String>>],
     a: &Arc<EventRecord>,
     b: &Arc<EventRecord>,
 ) -> Ordering {
-    let a_score = combined_search_score(a, filters);
-    let b_score = combined_search_score(b, filters);
+    let a_score = combined_search_score(a, parsed_search_terms);
+    let b_score = combined_search_score(b, parsed_search_terms);
     b_score
         .cmp(&a_score)
         .then_with(|| compare_events_desc(a, b))
 }
 
-fn combined_search_score(event: &EventRecord, filters: &[Filter]) -> usize {
-    filters
+fn combined_search_score(
+    event: &EventRecord,
+    parsed_search_terms: &[Option<Vec<String>>],
+) -> usize {
+    parsed_search_terms
         .iter()
-        .filter_map(|filter| filter.search.as_ref().and_then(|q| search_score(event, q)))
+        .filter_map(|search_terms| {
+            search_terms
+                .as_deref()
+                .and_then(|terms| search_score_for_terms(event, terms))
+        })
         .max()
         .unwrap_or(0)
 }
 
 #[cfg(test)]
 pub(crate) fn count_matching_events(state: &RelayState, filters: &[Filter]) -> usize {
+    count_matching_events_inner(state, filters, None)
+}
+
+fn count_matching_events_inner(
+    state: &RelayState,
+    filters: &[Filter],
+    auth: Option<&ConnectionAuth>,
+) -> usize {
+    let now = current_unix_timestamp();
+    let parsed_search_terms = parsed_search_terms_for_filters(filters);
     let mut selected = HashSet::new();
 
-    for filter in filters {
-        let matching = if let Some(ids) = &filter.ids {
-            ids.iter()
-                .filter_map(|id| {
-                    state
-                        .events_by_id
-                        .get(id)
-                        .or_else(|| state.archived_events_by_id.get(id))
-                        .cloned()
-                })
-                .collect::<Vec<_>>()
-        } else {
-            state.events_by_id.values().cloned().collect::<Vec<_>>()
-        };
-
-        for event in matching {
-            if !state.deleted_event_ids.contains(&event.id)
-                && !state.banned_events.contains_key(&event.id)
-                && !state.banned_pubkeys.contains_key(&event.pubkey)
-                && (state.allowed_pubkeys.is_empty()
-                    || state.allowed_pubkeys.contains_key(&event.pubkey))
-                && (state.allowed_kinds.is_empty() || state.allowed_kinds.contains(&event.kind))
-                && !event_blocked_by_address_tombstone(&event, &state.deleted_addresses)
-                && (filter.ids.is_some() || !event_is_superseded(&event, state))
-                && !is_event_expired(&event, current_unix_timestamp())
-                && event_matches_filter(&event, filter)
+    for (filter, search_terms) in filters.iter().zip(parsed_search_terms.iter()) {
+        for_each_filter_candidate(state, filter, |event| {
+            if event_matches_initial_query(event, state, filter, search_terms.as_deref(), auth, now)
             {
                 selected.insert(event.id.clone());
             }
-        }
+        });
     }
 
     selected.len()
@@ -295,42 +278,50 @@ pub(crate) fn count_matching_events_for_auth(
     filters: &[Filter],
     auth: &ConnectionAuth,
 ) -> usize {
-    let mut selected = HashSet::new();
+    count_matching_events_inner(state, filters, Some(auth))
+}
 
-    for filter in filters {
-        let matching = if let Some(ids) = &filter.ids {
-            ids.iter()
-                .filter_map(|id| {
-                    state
-                        .events_by_id
-                        .get(id)
-                        .or_else(|| state.archived_events_by_id.get(id))
-                        .cloned()
-                })
-                .collect::<Vec<_>>()
-        } else {
-            state.events_by_id.values().cloned().collect::<Vec<_>>()
-        };
-
-        for event in matching {
-            if !state.deleted_event_ids.contains(&event.id)
-                && !state.banned_events.contains_key(&event.id)
-                && !state.banned_pubkeys.contains_key(&event.pubkey)
-                && (state.allowed_pubkeys.is_empty()
-                    || state.allowed_pubkeys.contains_key(&event.pubkey))
-                && (state.allowed_kinds.is_empty() || state.allowed_kinds.contains(&event.kind))
-                && !event_blocked_by_address_tombstone(&event, &state.deleted_addresses)
-                && (filter.ids.is_some() || !event_is_superseded(&event, state))
-                && !is_event_expired(&event, current_unix_timestamp())
-                && event_matches_filter(&event, filter)
-                && event_visible_to_auth(&event, auth)
+fn for_each_filter_candidate(
+    state: &RelayState,
+    filter: &Filter,
+    mut visit: impl FnMut(&Arc<EventRecord>),
+) {
+    if let Some(ids) = &filter.ids {
+        for id in ids {
+            if let Some(event) = state
+                .events_by_id
+                .get(id)
+                .or_else(|| state.archived_events_by_id.get(id))
             {
-                selected.insert(event.id.clone());
+                visit(event);
             }
         }
+        return;
     }
 
-    selected.len()
+    for event in state.events_by_id.values() {
+        visit(event);
+    }
+}
+
+fn event_matches_initial_query(
+    event: &EventRecord,
+    state: &RelayState,
+    filter: &Filter,
+    search_terms: Option<&[String]>,
+    auth: Option<&ConnectionAuth>,
+    now: i64,
+) -> bool {
+    !state.deleted_event_ids.contains(&event.id)
+        && !state.banned_events.contains_key(&event.id)
+        && !state.banned_pubkeys.contains_key(&event.pubkey)
+        && (state.allowed_pubkeys.is_empty() || state.allowed_pubkeys.contains_key(&event.pubkey))
+        && (state.allowed_kinds.is_empty() || state.allowed_kinds.contains(&event.kind))
+        && !event_blocked_by_address_tombstone(event, &state.deleted_addresses)
+        && (filter.ids.is_some() || !event_is_superseded(event, state))
+        && !is_event_expired(event, now)
+        && event_matches_filter_with_search_terms(event, filter, search_terms)
+        && auth.is_none_or(|auth| event_visible_to_auth(event, auth))
 }
 
 fn event_blocked_by_address_tombstone(
@@ -402,6 +393,15 @@ pub(crate) fn event_visible_to_auth(event: &EventRecord, auth: &ConnectionAuth) 
 }
 
 pub(crate) fn event_matches_filter(event: &EventRecord, filter: &Filter) -> bool {
+    let search_terms = filter.search.as_deref().map(parsed_search_terms_from_query);
+    event_matches_filter_with_search_terms(event, filter, search_terms.as_deref())
+}
+
+fn event_matches_filter_with_search_terms(
+    event: &EventRecord,
+    filter: &Filter,
+    search_terms: Option<&[String]>,
+) -> bool {
     if let Some(ids) = &filter.ids
         && !ids.iter().any(|id| id == &event.id)
     {
@@ -454,23 +454,26 @@ pub(crate) fn event_matches_filter(event: &EventRecord, filter: &Filter) -> bool
         }
     }
 
-    if let Some(search) = &filter.search
-        && search_score(event, search).is_none()
-    {
-        return false;
+    if filter.search.is_some() {
+        if let Some(search_terms) = search_terms {
+            if search_score_for_terms(event, search_terms).is_none() {
+                return false;
+            }
+        } else {
+            return false;
+        }
     }
 
     true
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn search_score(event: &EventRecord, query: &str) -> Option<usize> {
-    let terms = query
-        .split_whitespace()
-        .filter(|term| !term.contains(':'))
-        .map(|term| term.to_lowercase())
-        .filter(|term| !term.is_empty())
-        .collect::<Vec<_>>();
+    let terms = parsed_search_terms_from_query(query);
+    search_score_for_terms(event, &terms)
+}
 
+fn search_score_for_terms(event: &EventRecord, terms: &[String]) -> Option<usize> {
     if terms.is_empty() {
         return Some(0);
     }
@@ -482,4 +485,20 @@ pub(crate) fn search_score(event: &EventRecord, query: &str) -> Option<usize> {
         .sum::<usize>();
 
     if score == 0 { None } else { Some(score) }
+}
+
+fn parsed_search_terms_for_filters(filters: &[Filter]) -> Vec<Option<Vec<String>>> {
+    filters
+        .iter()
+        .map(|filter| filter.search.as_deref().map(parsed_search_terms_from_query))
+        .collect()
+}
+
+fn parsed_search_terms_from_query(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .filter(|term| !term.contains(':'))
+        .map(|term| term.to_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect()
 }

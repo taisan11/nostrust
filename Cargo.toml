@@ -4,11 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 negentropy = "0.5"
 nojson = "0.3"
 secp256k1 = "0.31"
 sha2 = "0.11"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
-turso = "0.6.0-pre.12"
+turso = "0.6"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = "symbols"

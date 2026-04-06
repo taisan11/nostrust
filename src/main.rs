@@ -42,8 +42,10 @@ use crate::commands::{
 use crate::crypto::{
     compute_event_id_from_serialized, verify_delegation_signature, verify_event_signature,
 };
+use crate::nip05::nip05_document;
 pub(crate) use crate::nip05::normalize_domain;
-use crate::nip05::{nip05_document, parse_nip05_identifier};
+#[cfg(test)]
+use crate::nip05::parse_nip05_identifier;
 use crate::nip11::relay_info_document;
 pub(crate) use crate::nip86::HttpRequest;
 use crate::nip86::{Nip86HttpError, handle_nip86_http_request, nip86_response_json};
